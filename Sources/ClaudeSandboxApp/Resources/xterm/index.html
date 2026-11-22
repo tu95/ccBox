@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Sandbox Terminal</title>
+  <link rel="stylesheet" href="./xterm.css" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #090a0d;
+      -webkit-user-select: none;
+    }
+    #terminal {
+      width: 100%;
+      height: 100%;
+      padding: 6px 8px;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+    .xterm {
+      width: 100%;
+      height: 100%;
+    }
+    .xterm-viewport::-webkit-scrollbar {
+      width: 8px;
+    }
+    .xterm-viewport::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .xterm-viewport::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.16);
+      border-radius: 4px;
+    }
+    .xterm-viewport::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.28);
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="./xterm.min.js"></script>
+  <script src="./addon-fit.min.js"></script>
+  <script src="./addon-unicode11.min.js"></script>
+  <script>
+    (function () {
+      const container = document.getElementById('terminal');
+      if (typeof window.Terminal === 'undefined') {
+        container.style.color = '#f87171';
+        container.style.fontFamily = 'Menlo, monospace';
+        container.style.fontSize = '12px';
+        container.textContent = '缺少离线 xterm.js 资源文件（xterm.min.js / xterm.css / addon-fit.min.js / addon-unicode11.min.js）。';
+        return;
+      }
+
+      const term = new window.Terminal({
+        allowProposedApi: true,
+        cursorBlink: true,
+        cursorStyle: 'block',
+        fontFamily: '"SF Mono", Menlo, Monaco, "PingFang SC", "Hiragino Sans GB", monospace',
+        fontSize: 12.5,
+        lineHeight: 1.2,
+        scrollback: 8000,
+        macOptionIsMeta: false,
+        macOptionClickForcesSelection: true,
+        theme: {
+          background: '#090a0d',
+          foreground: '#d9dee8',
+          cursor: '#67e8f9',
+          cursorAccent: '#090a0d',
+          selectionBackground: 'rgba(56, 189, 248, 0.30)',
+          black: '#1f2430',
+          red: '#f87171',
+          green: '#4ade80',
+          yellow: '#facc15',
+          blue: '#60a5fa',
+          magenta: '#c084fc',
+          cyan: '#22d3ee',
+          white: '#e2e8f0',
+          brightBlack: '#64748b',
+          brightRed: '#fca5a5',
+          brightGreen: '#86efac',
+          brightYellow: '#fde047',
+          brightBlue: '#93c5fd',
+          brightMagenta: '#d8b4fe',
+          brightCyan: '#67e8f9',
+          brightWhite: '#ffffff'
+        }
+      });
+
+      let fitAddon = null;
+      if (window.FitAddon && window.FitAddon.FitAddon) {
+        fitAddon = new window.FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+      }
+      if (window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon) {
+        const unicode11 = new window.Unicode11Addon.Unicode11Addon();
+        term.loadAddon(unicode11);
+        term.unicode.activeVersion = '11';
+      }
+
+      term.open(container);
+
+      const post = (name, payload) => {
+        try {
+          window.webkit.messageHandlers[name].postMessage(payload);
+        } catch (_) {}
+      };
+
+      let lastCols = 0;
+      let lastRows = 0;
+      function syncSize(force) {
+        if (fitAddon) {
+          try { fitAddon.fit(); } catch (_) {}
+        }
+        const cols = term.cols || 80;
+        const rows = term.rows || 24;
+        if (force || cols !== lastCols || rows !== lastRows) {
+          lastCols = cols;
+          lastRows = rows;
+          post('terminalResize', { cols, rows });
+        }
+      }
+
+      term.onData((data) => post('terminalInput', data));
+      term.onBinary((data) => post('terminalInput', data));
+      term.onResize(({ cols, rows }) => {
+        if (cols !== lastCols || rows !== lastRows) {
+          lastCols = cols;
+          lastRows = rows;
+          post('terminalResize', { cols, rows });
+        }
+      });
+
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== 'keydown') return true;
+        if (ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+          const key = ev.key.toLowerCase();
+          if (key === 'c' && term.hasSelection()) {
+            post('terminalCopy', term.getSelection());
+            return false;
+          }
+          if (key === 'v') {
+            post('terminalPaste', '');
+            return false;
+          }
+          if (key === 'k') {
+            term.clear();
+            return false;
+          }
+        }
+        return true;
+      });
+
+      const ro = new ResizeObserver(() => {
+        requestAnimationFrame(() => syncSize(false));
+      });
+      ro.observe(container);
+      window.addEventListener('resize', () => syncSize(false));
+
+      window.termWrite = function (base64) {
+        const raw = atob(base64);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          bytes[i] = raw.charCodeAt(i);
+        }
+        term.write(bytes);
+      };
+
+      window.termPaste = function (base64) {
+        const raw = atob(base64);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          bytes[i] = raw.charCodeAt(i);
+        }
+        const text = new TextDecoder('utf-8').decode(bytes);
+        term.paste(text);
+      };
+
+      window.termFit = function (force) {
+        syncSize(!!force);
+      };
+
+      window.termScrollToBottom = function () {
+        term.scrollToBottom();
+      };
+
+      window.termFocus = function () {
+        term.focus();
+      };
+
+      syncSize(true);
+      post('terminalReady', { cols: term.cols || 80, rows: term.rows || 24 });
+    })();
+  </script>
+</body>
+</html>
