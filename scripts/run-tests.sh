@@ -4,7 +4,7 @@ set -euo pipefail
 project="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project"
 
-echo "=== [1/3] Running Swift core & live runtime tests (12 checks) ==="
+echo "=== [1/3] Running Swift core & live runtime tests (13 checks) ==="
 swift run ${@+"$@"} ccbox-verify
 
 echo "=== [2/3] Verifying CoboxURLHook compilation & all exported hook symbols ==="
@@ -54,7 +54,7 @@ do
     exit 1
   fi
 done
-echo "[PASS] 13. libCoboxURLHook.dylib 编译、签名与全部 26 组核心拦截符号校验通过"
+echo "[PASS] 14. libCoboxURLHook.dylib 编译、签名与全部 26 组核心拦截符号校验通过"
 
 echo "=== [3/3] Running live DYLD_INSERT_LIBRARIES runtime behavior verification ==="
 probe_src="$tmp/hook_probe.m"
@@ -99,7 +99,7 @@ int main(void) {
         NSURL *escaped = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"../escape"];
         assert(escaped == nil || ![escaped.path containsString:@"../escape"]);
 
-        // 4. Locale spoofing
+        // 4. Locale consistency
         NSArray<NSString *> *langs = [NSLocale preferredLanguages];
         assert(langs.count >= 1 && [langs[0] isEqualToString:@"en-US"]);
 
@@ -140,12 +140,12 @@ probe_out="$(
   CCBOX_ISOLATED_KEYCHAIN="$tmp/apphome/Library/Keychains/login.keychain-db" \
   CCBOX_ISOLATED_KEYCHAIN_SECRET_FILE="$tmp/apphome/Library/Keychains/.keychain-secret" \
   CCBOX_PREFS_NAMESPACE="ccbox.verify.probe" \
-  CCBOX_SPOOF_LOCALE=1 \
+  CCBOX_ALIGN_LOCALE=1 \
   "$probe_bin"
 )"
 if [ "$probe_out" != "HOOK_RUNTIME_OK" ]; then
   echo "[FAIL] Live DYLD_INSERT_LIBRARIES hook probe failed: $probe_out" >&2
   exit 1
 fi
-echo "[PASS] 14. libCoboxURLHook.dylib 实机注入运行校验（代理锁/CFNetwork/SCDynamicStore/App Group/偏好命名空间/语言伪装）通过"
-echo "=== ALL 14/14 CCBOX VERIFICATION CHECKS PASSED ==="
+echo "[PASS] 15. libCoboxURLHook.dylib 实机注入运行校验（代理锁/CFNetwork/SCDynamicStore/App Group/偏好命名空间/语言一致性）通过"
+echo "=== ALL 15/15 CCBOX VERIFICATION CHECKS PASSED ==="

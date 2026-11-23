@@ -371,8 +371,8 @@ static id cobox_WKConfigInit(id self, SEL _cmd) {
         NSString *suite = coboxNamespacedPrefsDomain(coboxMainBundleIdentifier());
         // Calls the swizzled initWithSuiteName:, which preserves already-prefixed domains.
         isolatedStandard = [[NSUserDefaults alloc] initWithSuiteName:suite];
-        const char *spoof = getenv("CCBOX_SPOOF_LOCALE");
-        if (isolatedStandard && spoof && spoof[0] == '1') {
+        const char *alignLocale = getenv("CCBOX_ALIGN_LOCALE");
+        if (isolatedStandard && alignLocale && alignLocale[0] == '1') {
             [isolatedStandard registerDefaults:@{
                 @"AppleLanguages": @[@"en-US", @"en"],
                 @"AppleLocale": @"en_US"
@@ -409,13 +409,13 @@ static id cobox_WKConfigInit(id self, SEL _cmd) {
 
 @end
 
-// MARK: - 4. Locale Spoofing (NSLocale)
+// MARK: - 4. Locale Consistency (NSLocale)
 
 @implementation NSLocale (CoboxLocaleHook)
 
 + (NSArray<NSString *> *)cobox_preferredLanguages {
-    const char *spoof = getenv("CCBOX_SPOOF_LOCALE");
-    if (spoof && spoof[0] == '1') {
+    const char *alignLocale = getenv("CCBOX_ALIGN_LOCALE");
+    if (alignLocale && alignLocale[0] == '1') {
         return @[@"en-US", @"en"];
     }
     return [self cobox_preferredLanguages];
@@ -722,9 +722,9 @@ static void coboxInstallHooks(void) {
                              @selector(cobox_containerURLForSecurityApplicationGroupIdentifier:));
     }
 
-    // 5. Locale spoofing
-    const char *spoof = getenv("CCBOX_SPOOF_LOCALE");
-    if (spoof && spoof[0] == '1') {
+    // 5. Locale consistency
+    const char *alignLocale = getenv("CCBOX_ALIGN_LOCALE");
+    if (alignLocale && alignLocale[0] == '1') {
         coboxSwizzleClass([NSLocale class], @selector(preferredLanguages), @selector(cobox_preferredLanguages));
     }
 

@@ -1,4 +1,5 @@
 import XCTest
+import CCBoxNetworkFilterCore
 @testable import ClaudeSandboxCore
 
 final class SandboxCoreTests: XCTestCase {
@@ -239,6 +240,77 @@ final class SandboxCoreTests: XCTestCase {
         try terminal.start(launch, columns: 80, rows: 24)
         await fulfillment(of: [exited], timeout: 3)
         XCTAssertTrue(String(decoding: output, as: UTF8.self).contains("/private/tmp Asia/Shanghai"))
+    }
+
+    func testNetworkFilterPolicyOnlyConstrainsManagedBundleCopies() throws {
+        let copiedChrome = "/Users/test/Library/Application Support/ClaudeSandbox/Runtime/Google Chrome.app"
+        let application = NetworkFilterApplication(bundlePath: copiedChrome, allowedLoopbackPorts: [18080, 18081])
+        let policy = NetworkFilterPolicy(applications: [application])
+        let executable = copiedChrome + "/Contents/MacOS/Google Chrome"
+
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: "142.250.72.14", remotePort: "443"), .drop)
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: "2001:4860:4860::8888", remotePort: "53"), .drop)
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: "127.0.0.1", remotePort: "18080"), .allow)
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: "::1", remotePort: "18081"), .allow)
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: "127.0.0.1", remotePort: "7890"), .drop)
+        XCTAssertEqual(policy.decision(executablePath: executable, remoteHost: nil, remotePort: nil), .inspectData)
+        XCTAssertEqual(policy.decision(
+            executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            remoteHost: "142.250.72.14", remotePort: "443"
+        ), .allow)
+        XCTAssertEqual(policy.decision(
+            executablePath: copiedChrome + ".other/Contents/MacOS/Google Chrome",
+            remoteHost: "142.250.72.14", remotePort: "443"
+        ), .allow)
+        XCTAssertEqual(policy.decision(executablePath: nil, remoteHost: "142.250.72.14", remotePort: "443"), .allow)
+
+        let restored = try XCTUnwrap(NetworkFilterPolicy(vendorConfiguration: [
+            "revision": "v1",
+            "applications": [[
+                "bundlePath": copiedChrome,
+                "allowedLoopbackPorts": [18080, 18081]
+            ]]
+        ]))
+        XCTAssertEqual(restored, policy)
+        XCTAssertNil(NetworkFilterPolicy(vendorConfiguration: ["applications": [["bundlePath": copiedChrome]]]))
+    }
+
+    func testImportedAppRunsAfterOriginalBundleIsRemoved() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let source = folder.appendingPathComponent("Independent.app")
+        let macOS = source.appendingPathComponent("Contents/MacOS")
+        let nested = source.appendingPathComponent("Contents/Resources/Nested")
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let executable = macOS.appendingPathComponent("Independent")
+        try "#!/bin/sh\nprintf COPY_OK\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try "nested-resource".write(to: nested.appendingPathComponent("asset.txt"), atomically: true, encoding: .utf8)
+        let plist: [String: Any] = [
+            "CFBundleExecutable": "Independent",
+            "CFBundleIdentifier": "com.example.independent"
+        ]
+        let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try plistData.write(to: source.appendingPathComponent("Contents/Info.plist"))
+
+        let store = SandboxStore(root: folder.appendingPathComponent("state"))
+        let environment = SandboxEnvironment(name: "Independent", workspace: folder)
+        let imported = try store.importApp(at: source, for: environment)
+        XCTAssertNotEqual(imported.bundlePath, source.path)
+        XCTAssertTrue(imported.bundlePath.hasPrefix(store.directory(for: environment).path))
+        XCTAssertEqual(imported.sourceBundlePath, source.path)
+
+        try FileManager.default.removeItem(at: source)
+        let prepared = try await prepareImportedAppBundle(imported, environmentID: environment.id, storeRoot: store.root)
+        XCTAssertEqual(prepared.bundleURL.path, imported.bundlePath)
+        XCTAssertEqual(
+            try String(contentsOf: prepared.bundleURL.appendingPathComponent("Contents/Resources/Nested/asset.txt"), encoding: .utf8),
+            "nested-resource"
+        )
+        let result = try runTool(prepared.executableURL.path, arguments: [], captureOutput: true)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(decoding: result.output, as: UTF8.self), "COPY_OK")
     }
 
     func testMergeHookEntitlementsPreservesSafeAndStripsRestricted() throws {

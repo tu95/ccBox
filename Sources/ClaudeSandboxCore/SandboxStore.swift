@@ -23,11 +23,13 @@ public struct SandboxImportedApp: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public var name: String
     public var bundlePath: String
+    public var sourceBundlePath: String?
 
-    public init(id: UUID = UUID(), name: String, bundlePath: String) {
+    public init(id: UUID = UUID(), name: String, bundlePath: String, sourceBundlePath: String? = nil) {
         self.id = id
         self.name = name
         self.bundlePath = bundlePath
+        self.sourceBundlePath = sourceBundlePath
     }
 }
 
@@ -156,6 +158,14 @@ public struct SandboxStore: Sendable {
     public func save(_ environments: [SandboxEnvironment]) throws {
         try makePrivateDirectory(root)
         try writePrivate(JSONEncoder().encode(environments), to: indexURL)
+    }
+
+    public func importApp(at url: URL, for environment: SandboxEnvironment) throws -> SandboxImportedApp {
+        try importAppBundle(at: url, environmentID: environment.id, storeRoot: root)
+    }
+
+    public func removeImportedAppCopy(_ app: SandboxImportedApp, for environment: SandboxEnvironment) {
+        ClaudeSandboxCore.removeImportedAppCopy(app, environmentID: environment.id, storeRoot: root)
     }
 
     public func nodes(for environment: SandboxEnvironment) throws -> [String] {

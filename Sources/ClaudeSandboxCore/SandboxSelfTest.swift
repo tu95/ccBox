@@ -1,3 +1,4 @@
+import CCBoxNetworkFilterCore
 import Foundation
 
 public struct SandboxSelfTestResult: Sendable {
@@ -24,10 +25,11 @@ public enum SandboxSelfTest {
             ("6. 导入应用 Seatbelt 直通模式（禁直连 + 禁宿主凭证）", testImportedAppSeatbeltPassthrough),
             ("7. Seatbelt 内核级真机阻断实测（非嵌套环境）", testSeatbeltLiveExecutionIfPermitted),
             ("8. Chrome 防泄露参数与 Preferences 工作区锁定", testChromeAntiLeakAndPreferences),
-            ("9. 导入应用 Bundle 解析、Chrome/Electron 识别", testImportedAppBundleDetection),
-            ("10. 启动前 7 项伪装检测模型与状态判定", testPreFlightReportModel),
+            ("9. 导入应用完整复制、原包删除后独立运行与识别", testImportedAppBundleDetection),
+            ("10. 启动前 7 项代理环境检测模型与状态判定", testPreFlightReportModel),
             ("11. 导入应用权限合并与独立 Keychain 密钥/初始化", testEntitlementMergeAndIsolatedKeychain),
-            ("12. 工作区边界校验与纯隔离工作区拷贝", testWorkspaceValidationAndIsolationCopy)
+            ("12. 工作区边界校验与纯隔离工作区拷贝", testWorkspaceValidationAndIsolationCopy),
+            ("13. NetworkExtension 副本路径匹配与直连/回环端口策略", testNetworkFilterPolicy)
         ]
 
         var results: [SandboxSelfTestResult] = []
@@ -413,14 +415,17 @@ public enum SandboxSelfTest {
 
     // MARK: - 9. Imported App Bundle Detection
 
-    private static func testImportedAppBundleDetection() throws -> String {
+    private static func testImportedAppBundleDetection() async throws -> String {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
 
-        func makeFakeApp(name: String, bundleID: String, electron: Bool) throws -> URL {
+        func makeTestApp(name: String, bundleID: String, electron: Bool) throws -> URL {
             let bundle = base.appendingPathComponent("\(name).app", isDirectory: true)
             let macos = bundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
+            let nested = bundle.appendingPathComponent("Contents/Resources/Nested", isDirectory: true)
             try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+            try "independent".write(to: nested.appendingPathComponent("asset.txt"), atomically: true, encoding: .utf8)
             let exec = macos.appendingPathComponent(name)
             try "#!/bin/sh\nexit 0\n".write(to: exec, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exec.path)
@@ -435,18 +440,31 @@ public enum SandboxSelfTest {
             return bundle
         }
 
-        let fakeChrome = try makeFakeApp(name: "ChromeMock", bundleID: "com.google.Chrome", electron: false)
-        let fakeElectron = try makeFakeApp(name: "ElectronMock", bundleID: "com.example.electron", electron: true)
-        let fakeNative = try makeFakeApp(name: "NativeMock", bundleID: "com.example.native", electron: false)
+        let chromeApp = try makeTestApp(name: "ChromeMock", bundleID: "com.google.Chrome", electron: false)
+        let electronApp = try makeTestApp(name: "ElectronMock", bundleID: "com.example.electron", electron: true)
+        let nativeApp = try makeTestApp(name: "NativeMock", bundleID: "com.example.native", electron: false)
 
-        try expect(resolveBundleExecutable(at: fakeChrome) != nil, "未解析出可执行文件")
-        try expect(isChromeBundle(fakeChrome), "未能通过 BundleID 识别 Chrome")
-        try expect(!isChromeBundle(fakeNative), "原生应用被误判为 Chrome")
-        try expect(isChromiumOrElectronApp(fakeElectron), "未能识别 Electron 应用")
-        try expect(!isChromiumOrElectronApp(fakeNative), "原生应用被误判为 Electron")
-        try expect(isChromeImportedApp(SandboxImportedApp(name: "ChromeMock", bundlePath: fakeChrome.path)), "导入 Chrome 识别失败")
-        try expect(!isChromeImportedApp(SandboxImportedApp(name: "NativeMock", bundlePath: fakeNative.path)), "原生导入应用误判为 Chrome")
-        return "Executable/BundleID/Chrome/Electron/原生应用识别全部准确"
+        try expect(resolveBundleExecutable(at: chromeApp) != nil, "未解析出可执行文件")
+        try expect(isChromeBundle(chromeApp), "未能通过 BundleID 识别 Chrome")
+        try expect(!isChromeBundle(nativeApp), "原生应用被误判为 Chrome")
+        try expect(isChromiumOrElectronApp(electronApp), "未能识别 Electron 应用")
+        try expect(!isChromiumOrElectronApp(nativeApp), "原生应用被误判为 Electron")
+        try expect(isChromeImportedApp(SandboxImportedApp(name: "ChromeMock", bundlePath: chromeApp.path)), "导入 Chrome 识别失败")
+        try expect(!isChromeImportedApp(SandboxImportedApp(name: "NativeMock", bundlePath: nativeApp.path)), "原生导入应用误判为 Chrome")
+
+        let store = SandboxStore(root: base.appendingPathComponent("state", isDirectory: true))
+        let environment = SandboxEnvironment(name: "Independent", workspace: base)
+        let imported = try store.importApp(at: nativeApp, for: environment)
+        try expect(imported.bundlePath != nativeApp.path, "导入后仍引用原应用路径")
+        try expect(imported.bundlePath.hasPrefix(store.directory(for: environment).path), "副本未放入当前环境目录")
+        try FileManager.default.removeItem(at: nativeApp)
+        let prepared = try await prepareImportedAppBundle(imported, environmentID: environment.id, storeRoot: store.root)
+        try expect(prepared.bundleURL.path == imported.bundlePath, "启动时未使用环境内副本")
+        let resource = prepared.bundleURL.appendingPathComponent("Contents/Resources/Nested/asset.txt")
+        try expect(try String(contentsOf: resource, encoding: .utf8) == "independent", "嵌套资源未完整复制")
+        let execution = try runTool(prepared.executableURL.path, arguments: [])
+        try expect(execution.status == 0, "删除原应用后副本无法独立执行")
+        return "完整 Bundle 复制、删除原包后独立执行及 Chrome/Electron/原生识别全部通过"
     }
 
     // MARK: - 10. Pre-Flight Check Report
@@ -471,7 +489,7 @@ public enum SandboxSelfTest {
             isp: nil, asn: nil, timeZone: nil
         )
         try expect(!failReport.allPassed && failReport.hasFailure && failReport.passedCount == 1, "失败状态汇总异常")
-        return "7 项伪装检测报告汇总状态校验通过"
+        return "7 项代理环境检测报告汇总状态校验通过"
     }
 
     // MARK: - 11. Entitlement Merge & Isolated Keychain
@@ -573,5 +591,27 @@ public enum SandboxSelfTest {
         try "sandbox-v2".write(to: copiedFile, atomically: true, encoding: .utf8)
         try expect(try String(contentsOf: sourceWS.appendingPathComponent("README.txt"), encoding: .utf8) == "host-v1", "修改隔离工作区污染了源目录")
         return "危险根目录拦截与隔离工作区独立拷贝防污染校验通过"
+    }
+
+    // MARK: - 13. Network Extension Policy
+
+    private static func testNetworkFilterPolicy() throws -> String {
+        let bundle = "/tmp/ccbox/Google Chrome.app"
+        let executable = bundle + "/Contents/MacOS/Google Chrome"
+        let policy = NetworkFilterPolicy(applications: [
+            NetworkFilterApplication(bundlePath: bundle, allowedLoopbackPorts: [18080, 18081])
+        ])
+        try expect(policy.decision(executablePath: executable, remoteHost: "203.0.113.8", remotePort: "443") == .drop,
+                   "受管副本外网直连未被拦截")
+        try expect(policy.decision(executablePath: executable, remoteHost: "127.0.0.1", remotePort: "18080") == .allow,
+                   "当前代理端口未放行")
+        try expect(policy.decision(executablePath: executable, remoteHost: "127.0.0.1", remotePort: "7890") == .drop,
+                   "非指定回环端口形成旁路")
+        try expect(policy.decision(executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                                   remoteHost: "203.0.113.8", remotePort: "443") == .allow,
+                   "宿主机原应用被误拦截")
+        try expect(policy.decision(executablePath: executable, remoteHost: nil, remotePort: nil) == .inspectData,
+                   "未知远端未进入二次检查")
+        return "仅约束环境内副本；外网丢弃、指定代理端口放行、宿主应用不受影响"
     }
 }

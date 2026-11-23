@@ -64,6 +64,24 @@ if [ -f "$project/scripts/AppIcon.icns" ]; then
   cp "$project/scripts/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 fi
 sign_identity="${CCBOX_CODESIGN_IDENTITY:--}"
+network_filter="${CCBOX_ENABLE_NETWORK_FILTER:-0}"
+if [ "$network_filter" = "1" ]; then
+  app_profile="${CCBOX_APP_PROVISIONING_PROFILE:-}"
+  extension_profile="${CCBOX_NETWORK_FILTER_PROVISIONING_PROFILE:-}"
+  if [ "$sign_identity" = "-" ] || [ ! -f "$app_profile" ] || [ ! -f "$extension_profile" ]; then
+    echo "NetworkExtension packaging requires CCBOX_CODESIGN_IDENTITY, CCBOX_APP_PROVISIONING_PROFILE, and CCBOX_NETWORK_FILTER_PROVISIONING_PROFILE." >&2
+    exit 1
+  fi
+  cp "$app_profile" "$app/Contents/embedded.provisionprofile"
+  network_extension="$app/Contents/Library/SystemExtensions/com.tu95.ccbox.NetworkFilter.systemExtension"
+  mkdir -p "$network_extension/Contents/MacOS"
+  cp "$build/CCBoxNetworkFilter" "$network_extension/Contents/MacOS/"
+  cp "$project/scripts/NetworkFilterInfo.plist" "$network_extension/Contents/Info.plist"
+  cp "$extension_profile" "$network_extension/Contents/embedded.provisionprofile"
+  codesign --force --sign "$sign_identity" \
+    --entitlements "$project/scripts/CCBoxNetworkFilter.entitlements" "$network_extension"
+  codesign --verify --strict "$network_extension"
+fi
 if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   arch_flag="$(uname -m)"
   /usr/bin/clang -dynamiclib -fobjc-arc -arch "$arch_flag" -mmacosx-version-min=13.0 \
@@ -80,7 +98,11 @@ if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_LSOpenCFURLRef"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "CoboxPanelDelegateGuard"
 fi
-codesign --force --sign "$sign_identity" "$app"
+if [ "$network_filter" = "1" ]; then
+  codesign --force --sign "$sign_identity" --entitlements "$project/scripts/CCBox.entitlements" "$app"
+else
+  codesign --force --sign "$sign_identity" "$app"
+fi
 codesign --verify --strict "$app"
 rm -rf "$output/$app_name"
 mv "$app" "$output/$app_name"

@@ -1,3 +1,4 @@
+import CCBoxNetworkFilterCore
 import Darwin
 import Foundation
 
@@ -61,6 +62,7 @@ public final class SandboxRunner {
     public var onBrowserExit: ((pid_t, Int32) -> Void)?
     public var onAppStart: ((UUID, pid_t) -> Void)?
     public var onAppExit: ((UUID, pid_t, Int32) -> Void)?
+    public var onNetworkFilterApplicationsChanged: (() -> Void)?
     public var browserProcessIdentifier: pid_t? { browser?.processIdentifier }
     public func appProcessIdentifier(for appID: UUID) -> pid_t? { importedAppProcesses[appID]?.processIdentifier }
     public var runningImportedAppPIDs: [pid_t] { importedAppProcesses.values.map(\.processIdentifier) }
@@ -92,8 +94,33 @@ public final class SandboxRunner {
     private var chromePreparation: Task<URL, Error>?
     private var ready = false
 
+    public var networkFilterApplications: [NetworkFilterApplication] {
+        guard ready, activeSandboxExec != nil, let environmentID = activeEnvironmentID,
+              let proxyLaunch = activeProxyLaunch else { return [] }
+        var ports: Set<Int> = [Int(proxyLaunch.httpPort), Int(proxyLaunch.socksPort)]
+        if let bridgePort = browserBridge?.port { ports.insert(Int(bridgePort)) }
+        var applications = [NetworkFilterApplication(
+            bundlePath: store.root.appendingPathComponent("Runtime/Google Chrome.app", isDirectory: true).path,
+            allowedLoopbackPorts: ports
+        )]
+        applications.append(contentsOf: activeImportedApps.map { app in
+            let bundle: URL
+            if app.sourceBundlePath != nil {
+                bundle = URL(fileURLWithPath: app.bundlePath, isDirectory: true)
+            } else {
+                let stored = URL(fileURLWithPath: app.bundlePath, isDirectory: true)
+                bundle = store.root
+                    .appendingPathComponent(environmentID.uuidString, isDirectory: true)
+                    .appendingPathComponent("ImportedApps/\(app.id.uuidString)/\(stored.lastPathComponent)", isDirectory: true)
+            }
+            return NetworkFilterApplication(bundlePath: bundle.path, allowedLoopbackPorts: ports)
+        })
+        return applications
+    }
+
     public func updateImportedApps(_ apps: [SandboxImportedApp]) {
         activeImportedApps = apps
+        onNetworkFilterApplicationsChanged?()
     }
 
     public init(store: SandboxStore) {
@@ -135,6 +162,7 @@ public final class SandboxRunner {
             )
             try ensureSession(token)
             ready = true
+            onNetworkFilterApplicationsChanged?()
             return launch
         } catch {
             if sessionID == token { stop() }
@@ -336,6 +364,7 @@ public final class SandboxRunner {
 
     public func startImportedApp(_ app: SandboxImportedApp, opening initialURL: URL? = nil) async throws {
         guard ready, let token = sessionID, proxy?.isRunning == true,
+              let environmentID = activeEnvironmentID,
               let folder = activeEnvironmentFolder,
               let workspace = activeWorkspace,
               let sourceWorkspace = activeSourceWorkspace,
@@ -354,7 +383,7 @@ public final class SandboxRunner {
         importedAppCopying.insert(app.id)
         defer { importedAppCopying.remove(app.id) }
 
-        let prepared = try await prepareImportedAppBundle(app, storeRoot: store.root)
+        let prepared = try await prepareImportedAppBundle(app, environmentID: environmentID, storeRoot: store.root)
         try ensureSession(token)
         guard proxy?.isRunning == true else { throw SandboxFailure("代理已停止，请重新启动沙箱会话。") }
         guard let runtime else { throw CancellationError() }
@@ -417,7 +446,7 @@ public final class SandboxRunner {
             environment["CCBOX_ISOLATED_KEYCHAIN"] = appHome.appendingPathComponent("Library/Keychains/login.keychain-db").path
             environment["CCBOX_ISOLATED_KEYCHAIN_SECRET_FILE"] = isolatedKeychainSecretURL(at: appHome).path
             environment["CCBOX_PREFS_NAMESPACE"] = "ccbox.\(envPrefix).\(appPrefix)"
-            environment["CCBOX_SPOOF_LOCALE"] = "1"
+            environment["CCBOX_ALIGN_LOCALE"] = "1"
             environment["LANG"] = "en_US.UTF-8"
             environment["LC_ALL"] = "en_US.UTF-8"
             environment["LC_CTYPE"] = "en_US.UTF-8"
@@ -574,6 +603,7 @@ public final class SandboxRunner {
         } else if let sessionDirectory {
             try? FileManager.default.removeItem(at: sessionDirectory)
         }
+        onNetworkFilterApplicationsChanged?()
     }
 
     private func terminate(_ process: Process) {

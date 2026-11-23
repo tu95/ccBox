@@ -12,7 +12,7 @@ struct ProxyCheckPopoverView: View {
                     .font(.system(size: 18))
                     .foregroundStyle(color)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(report.allPassed ? "全部检测通过 · 已隐藏完毕" : (report.hasFailure ? "检测到风险项 · 请检查节点" : "大部分通过 · 存在提醒项"))
+                    Text(report.allPassed ? "全部检测通过 · 代理环境就绪" : (report.hasFailure ? "检测到风险项 · 请检查节点" : "大部分通过 · 存在提醒项"))
                         .font(.system(size: 13, weight: .semibold))
                     Text("已通过 \(report.passedCount) / \(report.totalCount) 项 · 对齐 ip.net.coffee/claude")
                         .font(.system(size: 10.5))
@@ -92,7 +92,7 @@ struct ProxyCheckSidebarCard: View {
                 Image(systemName: report.allPassed ? "checkmark.shield.fill" : (report.hasFailure ? "exclamationmark.shield.fill" : "shield.lefthalf.filled"))
                     .font(.system(size: 11))
                     .foregroundStyle(accent)
-                Text(report.allPassed ? "伪装全过 \(report.passedCount)/\(report.totalCount)" : "伪装检测 \(report.passedCount)/\(report.totalCount)")
+                Text(report.allPassed ? "环境检测通过 \(report.passedCount)/\(report.totalCount)" : "代理环境检测 \(report.passedCount)/\(report.totalCount)")
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(accent)
                 Spacer()

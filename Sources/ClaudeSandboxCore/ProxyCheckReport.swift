@@ -210,7 +210,7 @@ func runProxyPreFlightChecks(
     // 5. DNS / QUIC / WebRTC Leak Protection
     items.append(ProxyCheckItem(
         id: "dns-webrtc",
-        title: "DNS / WebRTC / QUIC 隐藏",
+        title: "DNS / WebRTC / QUIC 泄露防护",
         detail: "已启用远程 DNS 解析、禁本地 DNS、禁 QUIC 与非代理 WebRTC UDP",
         status: .pass
     ))
@@ -233,11 +233,11 @@ func runProxyPreFlightChecks(
         ))
     }
 
-    // 7. Browser Web Language Spoofing
+    // 7. Browser Web Language Consistency
     items.append(ProxyCheckItem(
         id: "language",
-        title: "浏览器语言伪装",
-        detail: "网页语言已覆写为 en-US,en（浏览器菜单保持中文）",
+        title: "浏览器语言一致性",
+        detail: "网页语言已统一为 en-US,en（浏览器菜单保持中文）",
         status: .pass
     ))
 

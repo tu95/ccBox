@@ -49,10 +49,12 @@ final class DashboardModel: ObservableObject {
     @Published var selectedID: UUID?
     @Published var nodes: [String] = []
     @Published var isImporting = false
+    @Published var importingAppName: String?
     @Published var errorMessage: String?
     @Published var notice: String?
 
     let store: SandboxStore
+    let networkFilter = NetworkFilterManager()
     private var sessions: [UUID: EnvironmentSession] = [:]
     private let borderOverlay = WindowBorderOverlayManager()
     private var terminateObserver: NSObjectProtocol?
@@ -64,6 +66,11 @@ final class DashboardModel: ObservableObject {
             .appendingPathComponent("claude-sandbox-demo-\(UUID().uuidString)", isDirectory: true) : nil
         store = SandboxStore(root: demoRoot?.appendingPathComponent("state", isDirectory: true))
         demoPending = demo
+        networkFilter.onChange = { [weak self] in self?.objectWillChange.send() }
+        Task {
+            await networkFilter.refresh()
+            synchronizeNetworkFilter()
+        }
         terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -153,6 +160,9 @@ final class DashboardModel: ObservableObject {
                 self.errorMessage = "\(app.name) 已异常退出（退出码 \(status)）。"
             }
             self.objectWillChange.send()
+        }
+        created.runner.onNetworkFilterApplicationsChanged = { [weak self] in
+            self?.synchronizeNetworkFilter()
         }
         sessions[id] = created
         return created
@@ -462,7 +472,7 @@ final class DashboardModel: ObservableObject {
             current.inspectedExit = nil
             current.checkReport = nil
             current.exitIP = nil
-            current.proxyState = selected.node == nil ? "正在启动 Seatbelt…" : "正在启动 mihomo 并执行伪装检测…"
+            current.proxyState = selected.node == nil ? "正在启动 Seatbelt…" : "正在启动 mihomo 并检测代理环境…"
         }
         switch target {
         case .session, .terminal: break
@@ -538,6 +548,32 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    func toggleNetworkFilter() {
+        guard !networkFilter.status.isBusy else { return }
+        Task {
+            do {
+                if networkFilter.status == .active {
+                    try await networkFilter.disable()
+                } else {
+                    await networkFilter.updateApplications(sessions.values.flatMap(\.runner.networkFilterApplications))
+                    try await networkFilter.enable()
+                    synchronizeNetworkFilter()
+                }
+                notice = networkFilter.status == .active
+                    ? "系统网络防护已接管 CCBox 应用直连拦截"
+                    : "系统网络防护已关闭，Seatbelt 仍然有效"
+            } catch {
+                errorMessage = "系统网络防护操作失败：\(error.localizedDescription)"
+            }
+            objectWillChange.send()
+        }
+    }
+
+    private func synchronizeNetworkFilter() {
+        let applications = sessions.values.flatMap(\.runner.networkFilterApplications)
+        Task { await networkFilter.updateApplications(applications) }
+    }
+
     func isAppRunning(_ appID: UUID) -> Bool {
         activeSession?.runningAppIDs.contains(appID) == true
     }
@@ -547,8 +583,8 @@ final class DashboardModel: ObservableObject {
     }
 
     func importApp(_ url: URL, for environmentID: UUID) {
-        guard let index = environments.firstIndex(where: { $0.id == environmentID }) else { return }
-        var environment = environments[index]
+        guard !isImporting, let index = environments.firstIndex(where: { $0.id == environmentID }) else { return }
+        let environment = environments[index]
         let standardized = url.standardizedFileURL.resolvingSymlinksInPath()
         guard standardized.pathExtension.lowercased() == "app",
               let bundle = Bundle(url: standardized), let executable = bundle.executableURL,
@@ -560,22 +596,52 @@ final class DashboardModel: ObservableObject {
             notice = "可以直接使用首页的 Chrome 入口"
             return
         }
-        if environment.importedApps.contains(where: { $0.bundlePath == standardized.path }) {
+        if environment.importedApps.contains(where: {
+            $0.bundlePath == standardized.path || $0.sourceBundlePath == standardized.path
+        }) {
             notice = "该应用已在当前环境列表中"
             return
         }
         let appName = standardized.deletingPathExtension().lastPathComponent
-        environment.importedApps.append(SandboxImportedApp(name: appName, bundlePath: standardized.path))
-        var updated = environments
-        updated[index] = environment
-        do {
-            try store.save(updated)
-            environments = updated
-            session(for: environment).runner.updateImportedApps(environment.importedApps)
-            notice = "已导入应用「\(appName)」"
-            objectWillChange.send()
-        } catch {
-            errorMessage = "保存应用配置失败：\(error.localizedDescription)"
+        let store = self.store
+        isImporting = true
+        importingAppName = appName
+        notice = "正在完整复制应用「\(appName)」到当前环境…"
+        Task {
+            var copiedApp: SandboxImportedApp?
+            var saved = false
+            defer {
+                if let copiedApp, !saved {
+                    store.removeImportedAppCopy(copiedApp, for: environment)
+                }
+                isImporting = false
+                importingAppName = nil
+            }
+            do {
+                let copied = try await Task.detached {
+                    try store.importApp(at: standardized, for: environment)
+                }.value
+                copiedApp = copied
+                guard let currentIndex = environments.firstIndex(where: { $0.id == environmentID }) else { return }
+                var current = environments[currentIndex]
+                if current.importedApps.contains(where: {
+                    $0.bundlePath == standardized.path || $0.sourceBundlePath == standardized.path
+                }) {
+                    notice = "该应用已在当前环境列表中"
+                    return
+                }
+                current.importedApps.append(copied)
+                var updated = environments
+                updated[currentIndex] = current
+                try store.save(updated)
+                environments = updated
+                session(for: current).runner.updateImportedApps(current.importedApps)
+                saved = true
+                notice = "已完整复制并导入应用「\(appName)」，原应用卸载后仍可运行"
+                objectWillChange.send()
+            } catch {
+                errorMessage = "导入应用失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -588,6 +654,7 @@ final class DashboardModel: ObservableObject {
         do {
             try store.save(updated)
             stopImportedApp(app)
+            store.removeImportedAppCopy(app, for: selected)
             environments = updated
             session(for: selected).runner.updateImportedApps(selected.importedApps)
         } catch {
@@ -797,6 +864,7 @@ struct MainView: View {
                 checkReportBadge(report)
             }
 
+            networkFilterButton
             statusPill
 
             Button {
@@ -817,6 +885,30 @@ struct MainView: View {
         .padding(.horizontal, 16)
         .frame(height: 56)
         .background(Color(red: 0.065, green: 0.075, blue: 0.095))
+    }
+
+    private var networkFilterButton: some View {
+        let active = model.networkFilter.status == .active
+        let failed: Bool
+        if case .failed = model.networkFilter.status { failed = true } else { failed = false }
+        let color: Color = active ? .green : (failed ? .red : .secondary)
+        return Button {
+            model.toggleNetworkFilter()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: active ? "shield.checkered" : "shield")
+                Text(active ? "防护已启用" : (failed ? "防护异常" : "系统防护"))
+            }
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 9).padding(.vertical, 6)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.networkFilter.status.isBusy)
+        .help(model.networkFilter.status.title)
+        .accessibilityIdentifier("networkFilterButton")
     }
 
     private var statusPill: some View {
@@ -849,8 +941,8 @@ struct MainView: View {
         let badgeColor: Color = report.allPassed ? .green : (report.hasFailure ? .red : .orange)
         let iconName = report.allPassed ? "checkmark.shield.fill" : (report.hasFailure ? "exclamationmark.shield.fill" : "shield.lefthalf.filled")
         let titleText = report.allPassed
-            ? "伪装全过 \(report.passedCount)/\(report.totalCount)"
-            : (report.hasFailure ? "检测异常 \(report.passedCount)/\(report.totalCount)" : "伪装 \(report.passedCount)/\(report.totalCount)")
+            ? "环境检测通过 \(report.passedCount)/\(report.totalCount)"
+            : (report.hasFailure ? "检测异常 \(report.passedCount)/\(report.totalCount)" : "环境检测 \(report.passedCount)/\(report.totalCount)")
         return Button {
             showingCheckPopover.toggle()
         } label: {
@@ -868,7 +960,7 @@ struct MainView: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("点击查看完整代理与隐藏检测报告")
+        .help("点击查看完整代理环境检测报告")
         .popover(isPresented: $showingCheckPopover, arrowEdge: .bottom) {
             ProxyCheckPopoverView(report: report)
         }
@@ -973,6 +1065,7 @@ struct MainView: View {
                                     .foregroundStyle(.secondary)
                                     .frame(width: 48, height: 48)
                             }
+                            .disabled(model.isImporting)
                         }
                     }
                     .padding(26)
@@ -1258,7 +1351,8 @@ struct MainView: View {
                 if model.isImporting {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("正在导入节点…").font(.system(size: 10)).foregroundStyle(.secondary)
+                        Text(model.importingAppName.map { "正在完整复制应用「\($0)」…" } ?? "正在导入节点…")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
                     }
                 }
 
