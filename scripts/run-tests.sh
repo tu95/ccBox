@@ -39,6 +39,10 @@ for sym in \
   cobox_SecItemCopyMatching \
   cobox_SecItemUpdate \
   cobox_SecItemDelete \
+  cobox_SecKeychainFindGenericPassword \
+  cobox_SecKeychainAddGenericPassword \
+  cobox_SecKeychainFindInternetPassword \
+  cobox_SecKeychainAddInternetPassword \
   cobox_containerURLForSecurityApplicationGroupIdentifier \
   cobox_preferredLanguages \
   CoboxPanelDelegateGuard \
@@ -50,7 +54,7 @@ do
     exit 1
   fi
 done
-echo "[PASS] 13. libCoboxURLHook.dylib 编译、签名与全部 22 组核心拦截符号校验通过"
+echo "[PASS] 13. libCoboxURLHook.dylib 编译、签名与全部 26 组核心拦截符号校验通过"
 
 echo "=== [3/3] Running live DYLD_INSERT_LIBRARIES runtime behavior verification ==="
 probe_src="$tmp/hook_probe.m"

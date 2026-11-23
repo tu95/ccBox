@@ -847,7 +847,94 @@ static OSStatus cobox_SecItemDelete(CFDictionaryRef query) {
 
 DYLD_INTERPOSE(cobox_CFPreferencesSetValue, CFPreferencesSetValue)
 DYLD_INTERPOSE(cobox_CFPreferencesSynchronize, CFPreferencesSynchronize)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static OSStatus cobox_SecKeychainFindGenericPassword(
+    CFTypeRef keychainOrArray,
+    UInt32 serviceNameLength, const char *serviceName,
+    UInt32 accountNameLength, const char *accountName,
+    UInt32 *passwordLength, void **passwordData,
+    SecKeychainItemRef *itemRef
+) {
+    SecKeychainRef kc = coboxIsolatedKeychain();
+    return SecKeychainFindGenericPassword(
+        kc ? (CFTypeRef)kc : keychainOrArray,
+        serviceNameLength, serviceName,
+        accountNameLength, accountName,
+        passwordLength, passwordData,
+        itemRef
+    );
+}
+
+static OSStatus cobox_SecKeychainAddGenericPassword(
+    SecKeychainRef keychain,
+    UInt32 serviceNameLength, const char *serviceName,
+    UInt32 accountNameLength, const char *accountName,
+    UInt32 passwordLength, const void *passwordData,
+    SecKeychainItemRef *itemRef
+) {
+    SecKeychainRef kc = coboxIsolatedKeychain();
+    return SecKeychainAddGenericPassword(
+        kc ? kc : keychain,
+        serviceNameLength, serviceName,
+        accountNameLength, accountName,
+        passwordLength, passwordData,
+        itemRef
+    );
+}
+
+static OSStatus cobox_SecKeychainFindInternetPassword(
+    CFTypeRef keychainOrArray,
+    UInt32 serverNameLength, const char *serverName,
+    UInt32 securityDomainLength, const char *securityDomain,
+    UInt32 accountNameLength, const char *accountName,
+    UInt32 pathLength, const char *path,
+    UInt16 port, SecProtocolType protocol, SecAuthenticationType authenticationType,
+    UInt32 *passwordLength, void **passwordData,
+    SecKeychainItemRef *itemRef
+) {
+    SecKeychainRef kc = coboxIsolatedKeychain();
+    return SecKeychainFindInternetPassword(
+        kc ? (CFTypeRef)kc : keychainOrArray,
+        serverNameLength, serverName,
+        securityDomainLength, securityDomain,
+        accountNameLength, accountName,
+        pathLength, path,
+        port, protocol, authenticationType,
+        passwordLength, passwordData,
+        itemRef
+    );
+}
+
+static OSStatus cobox_SecKeychainAddInternetPassword(
+    SecKeychainRef keychain,
+    UInt32 serverNameLength, const char *serverName,
+    UInt32 securityDomainLength, const char *securityDomain,
+    UInt32 accountNameLength, const char *accountName,
+    UInt32 pathLength, const char *path,
+    UInt16 port, SecProtocolType protocol, SecAuthenticationType authenticationType,
+    UInt32 passwordLength, const void *passwordData,
+    SecKeychainItemRef *itemRef
+) {
+    SecKeychainRef kc = coboxIsolatedKeychain();
+    return SecKeychainAddInternetPassword(
+        kc ? kc : keychain,
+        serverNameLength, serverName,
+        securityDomainLength, securityDomain,
+        accountNameLength, accountName,
+        pathLength, path,
+        port, protocol, authenticationType,
+        passwordLength, passwordData,
+        itemRef
+    );
+}
+#pragma clang diagnostic pop
+
 DYLD_INTERPOSE(cobox_SecItemAdd, SecItemAdd)
 DYLD_INTERPOSE(cobox_SecItemCopyMatching, SecItemCopyMatching)
 DYLD_INTERPOSE(cobox_SecItemUpdate, SecItemUpdate)
 DYLD_INTERPOSE(cobox_SecItemDelete, SecItemDelete)
+DYLD_INTERPOSE(cobox_SecKeychainFindGenericPassword, SecKeychainFindGenericPassword)
+DYLD_INTERPOSE(cobox_SecKeychainAddGenericPassword, SecKeychainAddGenericPassword)
+DYLD_INTERPOSE(cobox_SecKeychainFindInternetPassword, SecKeychainFindInternetPassword)
+DYLD_INTERPOSE(cobox_SecKeychainAddInternetPassword, SecKeychainAddInternetPassword)

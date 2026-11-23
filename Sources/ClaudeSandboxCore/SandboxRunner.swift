@@ -443,7 +443,7 @@ public final class SandboxRunner {
         if prepared.isChrome {
             appArguments = sandboxChromeArguments(browserProfile: appProfile, proxyLaunch: proxyLaunch, initialURL: initialURL)
         } else if prepared.isChromiumBased {
-            appArguments = ["--no-sandbox"] + chromeArguments(browserProfile: appProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
+            appArguments = ["--no-sandbox", "--use-mock-keychain"] + chromeArguments(browserProfile: appProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
         } else {
             appArguments = ["-AppleLanguages", "(en-US, en)", "-AppleLocale", "en_US"]
         }

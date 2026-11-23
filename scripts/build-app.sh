@@ -75,6 +75,7 @@ if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_SCDynamicStoreCopyProxies"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_CFPreferencesCopyAppValue"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_SecItemAdd"
+  nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_SecKeychainFindGenericPassword"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_containerURLForSecurityApplicationGroupIdentifier"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_LSOpenCFURLRef"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "CoboxPanelDelegateGuard"
