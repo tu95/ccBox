@@ -1,18 +1,49 @@
+import Darwin
 import Foundation
 
-private func canonicalPath(_ path: String) -> String {
-    URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+/// Resolves a path to the real kernel vnode path expected by macOS Seatbelt.
+/// `URL.resolvingSymlinksInPath()` strips `/private` from `/var`, `/tmp`, `/etc`,
+/// which breaks Seatbelt kernel matching; POSIX `realpath(3)` preserves `/private/...`.
+func canonicalSeatbeltPath(_ path: String) -> String {
+    let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+    if let resolved = realpath(standardized, nil) {
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    // Walk up to the nearest existing ancestor so non-existent leaf paths still resolve symlinks.
+    var cursor = URL(fileURLWithPath: standardized)
+    var trailing: [String] = []
+    while cursor.path != "/" {
+        if let resolved = realpath(cursor.path, nil) {
+            defer { free(resolved) }
+            var result = URL(fileURLWithPath: String(cString: resolved))
+            for component in trailing.reversed() {
+                result.appendPathComponent(component)
+            }
+            return result.path
+        }
+        trailing.append(cursor.lastPathComponent)
+        cursor.deleteLastPathComponent()
+    }
+
+    for prefix in ["/var", "/tmp", "/etc"] {
+        if standardized == prefix || standardized.hasPrefix(prefix + "/") {
+            return "/private" + standardized
+        }
+    }
+    return standardized
 }
 
 private func sbplString(_ path: String) -> String {
-    let escaped = canonicalPath(path)
+    let escaped = canonicalSeatbeltPath(path)
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
     return "\"\(escaped)\""
 }
 
 private func sbplSubpaths(_ paths: [String]) -> String {
-    Array(Set(paths.map(canonicalPath))).sorted().map { "  (subpath \(sbplString($0)))" }.joined(separator: "\n")
+    Array(Set(paths.map(canonicalSeatbeltPath))).sorted().map { "  (subpath \(sbplString($0)))" }.joined(separator: "\n")
 }
 
 func seatbeltProfile(

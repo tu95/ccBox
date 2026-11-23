@@ -5,7 +5,7 @@ project="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project"
 
 echo "=== [1/3] Running Swift core & live runtime tests (12 checks) ==="
-swift run "$@" ccbox-verify
+swift run ${@+"$@"} ccbox-verify
 
 echo "=== [2/3] Verifying CoboxURLHook compilation & all exported hook symbols ==="
 tmp="$(mktemp -d "/tmp/ccbox-hook-verify.XXXXXX")"

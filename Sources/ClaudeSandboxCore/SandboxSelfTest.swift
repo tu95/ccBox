@@ -261,8 +261,10 @@ public enum SandboxSelfTest {
         try expect(withProxy.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "缺少回环代理放行规则")
         try expect(withProxy.contains("(subpath \"/Users\")"), "未禁止访问 /Users")
         try expect(withProxy.contains("(subpath \"/Volumes\")"), "未禁止访问 /Volumes")
-        try expect(withProxy.contains(src.standardizedFileURL.resolvingSymlinksInPath().path), "未隔离原项目目录")
-        try expect(withProxy.contains(ws.standardizedFileURL.resolvingSymlinksInPath().path), "未放行隔离工作区")
+        try expect(canonicalSeatbeltPath("/var/folders/ccbox-test-nonexistent") == "/private/var/folders/ccbox-test-nonexistent", "未将 /var 规范化为 /private/var")
+        try expect(canonicalSeatbeltPath("/tmp/ccbox-test-nonexistent") == "/private/tmp/ccbox-test-nonexistent", "未将 /tmp 规范化为 /private/tmp")
+        try expect(withProxy.contains(canonicalSeatbeltPath(src.path)), "未隔离原项目目录")
+        try expect(withProxy.contains(canonicalSeatbeltPath(ws.path)), "未放行隔离工作区")
 
         let noProxy = seatbeltProfile(
             workspace: ws, source: src, store: store, configuration: cfg,
@@ -300,9 +302,9 @@ public enum SandboxSelfTest {
         try expect(profile.contains("(deny file-read* file-write*"), "导入应用缺少宿主机磁盘禁止规则")
         try expect(profile.contains("(subpath \"/Users\")"), "导入应用未封锁 /Users")
         try expect(profile.contains("(subpath \"/Volumes\")"), "导入应用未封锁 /Volumes")
-        try expect(profile.contains(src.standardizedFileURL.resolvingSymlinksInPath().path), "导入应用未封锁原项目目录")
-        try expect(profile.contains(ws.standardizedFileURL.resolvingSymlinksInPath().path), "导入应用未放行隔离工作区")
-        try expect(profile.contains(appRoot.standardizedFileURL.resolvingSymlinksInPath().path), "导入应用未放行专属数据目录")
+        try expect(profile.contains(canonicalSeatbeltPath(src.path)), "导入应用未封锁原项目目录")
+        try expect(profile.contains(canonicalSeatbeltPath(ws.path)), "导入应用未放行隔离工作区")
+        try expect(profile.contains(canonicalSeatbeltPath(appRoot.path)), "导入应用未放行专属数据目录")
         return "已封锁直连及 /Users、/Volumes、原目录，仅放行隔离区"
     }
 

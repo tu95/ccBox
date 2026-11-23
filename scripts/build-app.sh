@@ -18,7 +18,7 @@ done
 
 if [ "$skip_tests" -eq 0 ]; then
   echo ">>> Running full ccbox isolation verification suite before release build..."
-  "$project/scripts/run-tests.sh" "${swift_args[@]}"
+  "$project/scripts/run-tests.sh" ${swift_args[@]+"${swift_args[@]}"}
 fi
 
 if [ -f "$project/scripts/icon.png" ] && { [ ! -f "$project/scripts/AppIcon.icns" ] || [ "$project/scripts/icon.png" -nt "$project/scripts/AppIcon.icns" ]; }; then
@@ -49,8 +49,8 @@ PY
   rm -rf "$icon_tmp"
 fi
 
-swift build -c release "${swift_args[@]}"
-build="$(swift build -c release --show-bin-path "${swift_args[@]}")"
+swift build -c release ${swift_args[@]+"${swift_args[@]}"}
+build="$(swift build -c release --show-bin-path ${swift_args[@]+"${swift_args[@]}"})"
 
 mkdir -p "$output"
 staging="$(mktemp -d "$output/.build-app.XXXXXX")"
