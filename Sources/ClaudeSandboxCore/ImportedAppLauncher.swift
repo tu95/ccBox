@@ -135,10 +135,40 @@ private func ensureHookableSignature(for executableURL: URL, targetDir: URL) {
     }
 }
 
+private let legacyIsolatedKeychainPassword = "ccbox-isolated-keychain"
+
+func isolatedKeychainSecretURL(at appHome: URL) -> URL {
+    appHome.appendingPathComponent("Library/Keychains/.keychain-secret")
+}
+
+private func generateRandomKeychainPassword() -> String {
+    var bytes = [UInt8](repeating: 0, count: 32)
+    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+    if status == errSecSuccess {
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+    return UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+}
+
+func loadOrCreateIsolatedKeychainPassword(at appHome: URL, keychainExists: Bool) throws -> String {
+    let secretURL = isolatedKeychainSecretURL(at: appHome)
+    if let data = try? Data(contentsOf: secretURL) {
+        let existing = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !existing.isEmpty {
+            return existing
+        }
+    }
+    // Preserve compatibility with pre-existing isolated keychains created before per-env secrets.
+    let password = keychainExists ? legacyIsolatedKeychainPassword : generateRandomKeychainPassword()
+    try writePrivate(Data((password + "\n").utf8), to: secretURL)
+    return password
+}
+
 /// Pre-creates and unlocks a dedicated file-based `login.keychain-db` inside the
-/// imported app's isolated `HOME` so `securityd` does not fail with `-25294`/`-60006`
-/// when the app persists OAuth tokens or keystore keys, without polluting the host
-/// user's global keychain search list.
+/// imported app's isolated `HOME` with a per-environment random secret stored in
+/// a `0600` file, without polluting the host user's keychain search list or
+/// calling authorization-triggering APIs (such as `SecKeychainSetSettings`).
 @discardableResult
 func ensureIsolatedLoginKeychain(at appHome: URL) -> Bool {
     let keychainsDir = appHome.appendingPathComponent("Library/Keychains", isDirectory: true)
@@ -148,7 +178,20 @@ func ensureIsolatedLoginKeychain(at appHome: URL) -> Bool {
         return false
     }
     let keychainURL = keychainsDir.appendingPathComponent("login.keychain-db")
-    let password = "ccbox-isolated-keychain"
+    let keychainExists = FileManager.default.fileExists(atPath: keychainURL.path)
+    guard let password = try? loadOrCreateIsolatedKeychainPassword(at: appHome, keychainExists: keychainExists) else {
+        return false
+    }
+
+    // Never allow Security.framework to pop up a modal keychain password dialog.
+    var previousUIAllowed = DarwinBoolean(true)
+    let hasUIState = SecKeychainGetUserInteractionAllowed(&previousUIAllowed) == errSecSuccess
+    _ = SecKeychainSetUserInteractionAllowed(false)
+    defer {
+        if hasUIState {
+            _ = SecKeychainSetUserInteractionAllowed(previousUIAllowed.boolValue)
+        }
+    }
 
     // Snapshot the user's current keychain search list so we can restore it if needed.
     var originalSearchList: CFArray?
@@ -156,7 +199,7 @@ func ensureIsolatedLoginKeychain(at appHome: URL) -> Bool {
 
     var keychain: SecKeychain?
     let status: OSStatus
-    if FileManager.default.fileExists(atPath: keychainURL.path) {
+    if keychainExists {
         status = SecKeychainOpen(keychainURL.path, &keychain)
     } else {
         status = password.withCString { cstr in
@@ -179,14 +222,8 @@ func ensureIsolatedLoginKeychain(at appHome: URL) -> Bool {
         return false
     }
 
-    var settings = SecKeychainSettings(
-        version: UInt32(SEC_KEYCHAIN_SETTINGS_VERS1),
-        lockOnSleep: DarwinBoolean(false),
-        useLockInterval: DarwinBoolean(false),
-        lockInterval: UInt32.max
-    )
-    _ = SecKeychainSetSettings(kc, &settings)
-
+    // Only unlock — never call SecKeychainSetSettings/SecKeychainChangePassword,
+    // which can trigger system authorization prompts on locked keychains.
     let unlockStatus: OSStatus = password.withCString { cstr in
         SecKeychainUnlock(kc, UInt32(strlen(cstr)), cstr, true)
     }

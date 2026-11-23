@@ -63,13 +63,14 @@ cp "$project/scripts/Info.plist" "$app/Contents/Info.plist"
 if [ -f "$project/scripts/AppIcon.icns" ]; then
   cp "$project/scripts/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 fi
+sign_identity="${CCBOX_CODESIGN_IDENTITY:--}"
 if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   arch_flag="$(uname -m)"
   /usr/bin/clang -dynamiclib -fobjc-arc -arch "$arch_flag" -mmacosx-version-min=13.0 \
     -framework AppKit -framework CoreServices -framework CFNetwork -framework Network -framework SystemConfiguration -framework Security -O2 \
     "$project/Sources/CoboxURLHook/CoboxURLHook.m" \
     -o "$app/Contents/Resources/libCoboxURLHook.dylib"
-  codesign --force --sign - "$app/Contents/Resources/libCoboxURLHook.dylib"
+  codesign --force --sign "$sign_identity" "$app/Contents/Resources/libCoboxURLHook.dylib"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_CFNetworkCopySystemProxySettings"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_SCDynamicStoreCopyProxies"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_CFPreferencesCopyAppValue"
@@ -78,7 +79,7 @@ if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "cobox_LSOpenCFURLRef"
   nm -U "$app/Contents/Resources/libCoboxURLHook.dylib" | grep -q "CoboxPanelDelegateGuard"
 fi
-codesign --force --sign - "$app"
+codesign --force --sign "$sign_identity" "$app"
 codesign --verify --strict "$app"
 rm -rf "$output/$app_name"
 mv "$app" "$output/$app_name"

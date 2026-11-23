@@ -26,7 +26,8 @@ public enum SandboxSelfTest {
             ("8. Chrome 防泄露参数与 Preferences 工作区锁定", testChromeAntiLeakAndPreferences),
             ("9. 导入应用 Bundle 解析、Chrome/Electron 识别", testImportedAppBundleDetection),
             ("10. 启动前 7 项伪装检测模型与状态判定", testPreFlightReportModel),
-            ("11. 导入应用权限合并与独立 Keychain 初始化", testEntitlementMergeAndIsolatedKeychain)
+            ("11. 导入应用权限合并与独立 Keychain 密钥/初始化", testEntitlementMergeAndIsolatedKeychain),
+            ("12. 工作区边界校验与纯隔离工作区拷贝", testWorkspaceValidationAndIsolationCopy)
         ]
 
         var results: [SandboxSelfTestResult] = []
@@ -480,7 +481,10 @@ public enum SandboxSelfTest {
             "aps-environment": "production",
             "keychain-access-groups": ["EQHXZ8M8AV.com.google.GeminiMacOS"],
             "com.apple.security.application-groups": ["group.com.google.gemini"],
-            "com.apple.developer.team-identifier": "EQHXZ8M8AV"
+            "com.apple.developer.team-identifier": "EQHXZ8M8AV",
+            "com.apple.security.app-sandbox": true,
+            "com.apple.private.tcc.allow": ["kTCCServiceMicrophone"],
+            "com.apple.security.temporary-exception.files.absolute-path.read-only": ["/tmp"]
         ]
         let originalData = try PropertyListSerialization.data(fromPropertyList: original, format: .xml, options: 0)
         guard let mergedData = mergeHookEntitlements(originalPlistData: originalData),
@@ -494,20 +498,78 @@ public enum SandboxSelfTest {
         try expect(merged["keychain-access-groups"] == nil, "未剔除受限权限 keychain-access-groups")
         try expect(merged["com.apple.security.application-groups"] == nil, "未剔除受限权限 application-groups")
         try expect(merged["com.apple.developer.team-identifier"] == nil, "未剔除受限权限 team-identifier")
+        try expect(merged["com.apple.security.app-sandbox"] == nil, "未剔除 app-sandbox")
+        try expect(merged["com.apple.private.tcc.allow"] == nil, "未剔除 com.apple.private.*")
+        try expect(merged["com.apple.security.temporary-exception.files.absolute-path.read-only"] == nil, "未剔除 temporary-exception")
+
+        guard let emptyMergedData = mergeHookEntitlements(originalPlistData: nil),
+              let emptyMerged = try PropertyListSerialization.propertyList(from: emptyMergedData, format: nil) as? [String: Any] else {
+            throw SandboxFailure("空原始权限合并失败")
+        }
+        try expect(emptyMerged.count == 4, "空原始权限合并后应恰好包含 4 项 Hook 权限")
 
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let homeA = base.appendingPathComponent("home-a", isDirectory: true)
+        let homeB = base.appendingPathComponent("home-b", isDirectory: true)
+        let homeLegacy = base.appendingPathComponent("home-legacy", isDirectory: true)
+        for h in [homeA, homeB, homeLegacy] {
+            try FileManager.default.createDirectory(at: h.appendingPathComponent("Library/Keychains", isDirectory: true), withIntermediateDirectories: true)
+        }
         defer { try? FileManager.default.removeItem(at: base) }
-        let keychainPath = base.appendingPathComponent("Library/Keychains/login.keychain-db").path
-        let created = ensureIsolatedLoginKeychain(at: base)
+
+        let secretA = try loadOrCreateIsolatedKeychainPassword(at: homeA, keychainExists: false)
+        let secretB = try loadOrCreateIsolatedKeychainPassword(at: homeB, keychainExists: false)
+        try expect(secretA.count >= 32 && secretB.count >= 32, "随机钥匙串密钥长度不足")
+        try expect(secretA != secretB, "不同环境不应复用相同钥匙串密钥")
+        let secretA2 = try loadOrCreateIsolatedKeychainPassword(at: homeA, keychainExists: true)
+        try expect(secretA == secretA2, "已存在的环境密钥读取不一致")
+        let legacySecret = try loadOrCreateIsolatedKeychainPassword(at: homeLegacy, keychainExists: true)
+        try expect(legacySecret == "ccbox-isolated-keychain", "旧版已有钥匙串未兼容迁移")
+        let attrs = try FileManager.default.attributesOfItem(atPath: isolatedKeychainSecretURL(at: homeA).path)
+        let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        try expect((perms & 0o777) == 0o600, "钥匙串密钥文件权限应为 0600，实际为 \(String(perms & 0o777, radix: 8))")
+
+        let keychainPath = homeA.appendingPathComponent("Library/Keychains/login.keychain-db").path
+        let created = ensureIsolatedLoginKeychain(at: homeA)
         if !created {
-            return "权限合并通过（当前外层沙箱阻止 securityd 创建钥匙串，正常终端将执行实测）"
+            return "权限合并 + 每环境 0600 随机密钥 + 旧版兼容通过（当前外层沙箱阻止 securityd 创建钥匙串，正常终端将执行实测）"
         }
         try expect(FileManager.default.fileExists(atPath: keychainPath), "未生成独立 login.keychain-db")
-        try expect(ensureIsolatedLoginKeychain(at: base), "重复解锁独立 login.keychain-db 失败")
+        try expect(ensureIsolatedLoginKeychain(at: homeA), "重复解锁独立 login.keychain-db 失败")
         let listResult = try runTool("/usr/bin/security", arguments: ["list-keychains"], captureOutput: true)
         let listOutput = String(decoding: listResult.output, as: UTF8.self)
         try expect(!listOutput.contains(keychainPath), "独立钥匙串污染了宿主机 search list")
-        return "安全权限合并保留 + 独立 login.keychain-db 建库/解锁且零污染宿主机列表通过"
+        return "安全权限合并 + 每环境 0600 随机密钥 + 独立 login.keychain-db 无弹窗解锁通过"
+    }
+
+    // MARK: - 12. Workspace Validation & Isolated Copy
+
+    private static func testWorkspaceValidationAndIsolationCopy() throws -> String {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let storeRoot = base.appendingPathComponent("store", isDirectory: true)
+        let sourceWS = base.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sourceWS, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        try "host-v1".write(to: sourceWS.appendingPathComponent("README.txt"), atomically: true, encoding: .utf8)
+        let store = SandboxStore(root: storeRoot)
+
+        // Blocked dangerous roots must fail validation
+        for forbidden in [URL(fileURLWithPath: "/System"), URL(fileURLWithPath: "/usr"), storeRoot] {
+            var rejected = false
+            do { try validateWorkspace(forbidden, store: store) } catch { rejected = true }
+            try expect(rejected, "危险目录 \(forbidden.path) 未被 validateWorkspace 拒绝")
+        }
+        try validateWorkspace(sourceWS, store: store)
+
+        let envID = UUID()
+        let isolatedWS = try store.prepareWorkspace(for: envID, source: sourceWS)
+        try expect(isolatedWS.path != sourceWS.path, "隔离工作区路径与源目录重叠")
+        let copiedFile = isolatedWS.appendingPathComponent("README.txt")
+        try expect(try String(contentsOf: copiedFile, encoding: .utf8) == "host-v1", "隔离工作区未正确复制源文件")
+        try "sandbox-v2".write(to: copiedFile, atomically: true, encoding: .utf8)
+        try expect(try String(contentsOf: sourceWS.appendingPathComponent("README.txt"), encoding: .utf8) == "host-v1", "修改隔离工作区污染了源目录")
+        return "危险根目录拦截与隔离工作区独立拷贝防污染校验通过"
     }
 }

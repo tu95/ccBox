@@ -95,17 +95,15 @@ static NSString *coboxNamespacedPrefsDomain(NSString *domain) {
     return [prefix stringByAppendingString:domain];
 }
 
-static CFStringRef coboxNamespacedCFApplicationID(CFStringRef applicationID) {
+static NSString *coboxNamespacedCFApplicationID(CFStringRef applicationID) {
+    if (applicationID == NULL) return nil;
     NSString *ns = coboxPrefsNamespace();
-    if (ns.length == 0 || applicationID == NULL) return applicationID;
-    if (CFEqual(applicationID, kCFPreferencesAnyApplication)) return applicationID;
+    if (ns.length == 0) return (__bridge NSString *)applicationID;
+    if (CFEqual(applicationID, kCFPreferencesAnyApplication)) return (__bridge NSString *)applicationID;
     if (CFEqual(applicationID, kCFPreferencesCurrentApplication)) {
-        NSString *rewritten = coboxNamespacedPrefsDomain(coboxMainBundleIdentifier());
-        return (__bridge CFStringRef)rewritten;
+        return coboxNamespacedPrefsDomain(coboxMainBundleIdentifier());
     }
-    NSString *nsDomain = (__bridge NSString *)applicationID;
-    NSString *rewritten = coboxNamespacedPrefsDomain(nsDomain);
-    return (__bridge CFStringRef)rewritten;
+    return coboxNamespacedPrefsDomain((__bridge NSString *)applicationID);
 }
 
 static NSArray<NSString *> *coboxAllowedPaths(void) {
@@ -556,6 +554,19 @@ static void coboxGuardSavePanel(NSSavePanel *panel) {
 
 // MARK: - 6. In-Process Isolated Keychain Unlock & SecItem Redirection
 
+static NSString *coboxLoadIsolatedKeychainPassword(void) {
+    const char *secretPath = getenv("CCBOX_ISOLATED_KEYCHAIN_SECRET_FILE");
+    if (secretPath && secretPath[0] != '\0') {
+        NSString *path = [NSString stringWithUTF8String:secretPath];
+        NSString *raw = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length > 0) {
+            return trimmed;
+        }
+    }
+    return @"ccbox-isolated-keychain";
+}
+
 static SecKeychainRef coboxIsolatedKeychain(void) {
     static SecKeychainRef cached = NULL;
     static dispatch_once_t onceToken;
@@ -564,11 +575,20 @@ static SecKeychainRef coboxIsolatedKeychain(void) {
         if (!kcPath || kcPath[0] == '\0') return;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        Boolean prevUI = true;
+        Boolean hasUI = (SecKeychainGetUserInteractionAllowed(&prevUI) == errSecSuccess);
+        SecKeychainSetUserInteractionAllowed(false);
         SecKeychainRef kc = NULL;
         if (SecKeychainOpen(kcPath, &kc) == errSecSuccess && kc != NULL) {
-            const char *pw = "ccbox-isolated-keychain";
-            SecKeychainUnlock(kc, (UInt32)strlen(pw), pw, true);
+            NSString *pwString = coboxLoadIsolatedKeychainPassword();
+            const char *pw = pwString.UTF8String;
+            if (pw) {
+                SecKeychainUnlock(kc, (UInt32)strlen(pw), pw, true);
+            }
             cached = kc;
+        }
+        if (hasUI) {
+            SecKeychainSetUserInteractionAllowed(prevUI);
         }
 #pragma clang diagnostic pop
     });
@@ -749,27 +769,33 @@ static CFDictionaryRef cobox_SCDynamicStoreCopyProxies(SCDynamicStoreRef store) 
 }
 
 static CFPropertyListRef cobox_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef applicationID) {
-    return CFPreferencesCopyAppValue(key, coboxNamespacedCFApplicationID(applicationID));
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    return CFPreferencesCopyAppValue(key, domain ? (__bridge CFStringRef)domain : applicationID);
 }
 
 static void cobox_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef applicationID) {
-    CFPreferencesSetAppValue(key, value, coboxNamespacedCFApplicationID(applicationID));
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    CFPreferencesSetAppValue(key, value, domain ? (__bridge CFStringRef)domain : applicationID);
 }
 
 static Boolean cobox_CFPreferencesAppSynchronize(CFStringRef applicationID) {
-    return CFPreferencesAppSynchronize(coboxNamespacedCFApplicationID(applicationID));
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    return CFPreferencesAppSynchronize(domain ? (__bridge CFStringRef)domain : applicationID);
 }
 
 static CFPropertyListRef cobox_CFPreferencesCopyValue(CFStringRef key, CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
-    return CFPreferencesCopyValue(key, coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    return CFPreferencesCopyValue(key, domain ? (__bridge CFStringRef)domain : applicationID, userName, hostName);
 }
 
 static void cobox_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
-    CFPreferencesSetValue(key, value, coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    CFPreferencesSetValue(key, value, domain ? (__bridge CFStringRef)domain : applicationID, userName, hostName);
 }
 
 static Boolean cobox_CFPreferencesSynchronize(CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
-    return CFPreferencesSynchronize(coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+    NSString *domain = coboxNamespacedCFApplicationID(applicationID);
+    return CFPreferencesSynchronize(domain ? (__bridge CFStringRef)domain : applicationID, userName, hostName);
 }
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \

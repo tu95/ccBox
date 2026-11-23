@@ -415,6 +415,7 @@ public final class SandboxRunner {
             let appPrefix = String(app.id.uuidString.prefix(8)).lowercased()
             environment["CCBOX_APP_HOME"] = appHome.path
             environment["CCBOX_ISOLATED_KEYCHAIN"] = appHome.appendingPathComponent("Library/Keychains/login.keychain-db").path
+            environment["CCBOX_ISOLATED_KEYCHAIN_SECRET_FILE"] = isolatedKeychainSecretURL(at: appHome).path
             environment["CCBOX_PREFS_NAMESPACE"] = "ccbox.\(envPrefix).\(appPrefix)"
             environment["CCBOX_SPOOF_LOCALE"] = "1"
             environment["LANG"] = "en_US.UTF-8"
