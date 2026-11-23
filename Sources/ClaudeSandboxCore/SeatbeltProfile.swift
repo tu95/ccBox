@@ -113,7 +113,12 @@ func importedAppSeatbeltProfile(
         let hostCookies = homeURL.appendingPathComponent("Library/Cookies").path
         let hostHTTPStorage = homeURL.appendingPathComponent("Library/HTTPStorages").path
         let hostWebKit = homeURL.appendingPathComponent("Library/WebKit").path
-        let deniedSubpaths = [claudeDir, hostCookies, hostHTTPStorage, hostWebKit, store.root.path, runtime.path]
+        let hostKeychains = homeURL.appendingPathComponent("Library/Keychains").path
+        let hostGroupContainers = homeURL.appendingPathComponent("Library/Group Containers").path
+        let deniedSubpaths = [
+            claudeDir, hostCookies, hostHTTPStorage, hostWebKit,
+            hostKeychains, hostGroupContainers, store.root.path, runtime.path
+        ]
         let readWrite = [workspace.path, appRoot.path, appTemp.path]
         lines.append("(deny file-read* file-write*\n\(sbplSubpaths(deniedSubpaths))\n  (literal \(sbplString(claudeFile))))")
         lines.append("(allow file-read-metadata)")

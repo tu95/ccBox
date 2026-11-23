@@ -240,4 +240,45 @@ final class SandboxCoreTests: XCTestCase {
         await fulfillment(of: [exited], timeout: 3)
         XCTAssertTrue(String(decoding: output, as: UTF8.self).contains("/private/tmp Asia/Shanghai"))
     }
+
+    func testMergeHookEntitlementsPreservesSafeAndStripsRestricted() throws {
+        let original: [String: Any] = [
+            "com.apple.security.device.camera": true,
+            "com.apple.security.automation.apple-events": true,
+            "aps-environment": "production",
+            "keychain-access-groups": ["EQHXZ8M8AV.com.google.GeminiMacOS"],
+            "com.apple.security.application-groups": ["group.com.google.gemini"],
+            "com.apple.developer.team-identifier": "EQHXZ8M8AV"
+        ]
+        let originalData = try PropertyListSerialization.data(fromPropertyList: original, format: .xml, options: 0)
+        let mergedData = try XCTUnwrap(mergeHookEntitlements(originalPlistData: originalData))
+        let merged = try XCTUnwrap(PropertyListSerialization.propertyList(from: mergedData, format: nil) as? [String: Any])
+
+        XCTAssertEqual(merged["com.apple.security.device.camera"] as? Bool, true)
+        XCTAssertEqual(merged["com.apple.security.automation.apple-events"] as? Bool, true)
+        XCTAssertEqual(merged["com.apple.security.cs.allow-dyld-environment-variables"] as? Bool, true)
+        XCTAssertEqual(merged["com.apple.security.cs.disable-library-validation"] as? Bool, true)
+        XCTAssertEqual(merged["com.apple.security.cs.allow-unsigned-executable-memory"] as? Bool, true)
+        XCTAssertEqual(merged["com.apple.security.cs.allow-jit"] as? Bool, true)
+        XCTAssertNil(merged["aps-environment"])
+        XCTAssertNil(merged["keychain-access-groups"])
+        XCTAssertNil(merged["com.apple.security.application-groups"])
+        XCTAssertNil(merged["com.apple.developer.team-identifier"])
+    }
+
+    func testEnsureIsolatedLoginKeychainCreatesAndUnlocksWithoutPollutingSearchList() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let keychainPath = folder.appendingPathComponent("Library/Keychains/login.keychain-db").path
+        XCTAssertTrue(ensureIsolatedLoginKeychain(at: folder))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keychainPath))
+        // Re-opening and unlocking an existing keychain should also succeed cleanly.
+        XCTAssertTrue(ensureIsolatedLoginKeychain(at: folder))
+
+        let listResult = try runTool("/usr/bin/security", arguments: ["list-keychains"], captureOutput: true)
+        let listOutput = String(decoding: listResult.output, as: UTF8.self)
+        XCTAssertFalse(listOutput.contains(keychainPath), "Isolated keychain must not pollute host search list")
+    }
 }

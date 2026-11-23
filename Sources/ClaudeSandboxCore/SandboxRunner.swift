@@ -392,6 +392,10 @@ public final class SandboxRunner {
             )
         }
 
+        if !prepared.isChrome {
+            await Task.detached { _ = ensureIsolatedLoginKeychain(at: appHome) }.value
+        }
+
         var environment = chromeEnvironment(
             base: toolEnvironment,
             browserHome: appHome,
@@ -403,8 +407,15 @@ public final class SandboxRunner {
         environment["https_proxy"] = proxyLaunch.endpoint
         environment["all_proxy"] = "socks5h://127.0.0.1:\(proxyLaunch.socksPort)"
         environment["no_proxy"] = "localhost,127.0.0.1,::1"
+        environment["CCBOX_PROXY_HTTP_PORT"] = String(proxyLaunch.httpPort)
+        environment["CCBOX_PROXY_SOCKS_PORT"] = String(proxyLaunch.socksPort)
         environment["CCBOX_SANDBOX_WORKSPACE"] = workspace.path
         if !prepared.isChrome {
+            let envPrefix = String((activeEnvironmentID ?? token).uuidString.prefix(8)).lowercased()
+            let appPrefix = String(app.id.uuidString.prefix(8)).lowercased()
+            environment["CCBOX_APP_HOME"] = appHome.path
+            environment["CCBOX_ISOLATED_KEYCHAIN"] = appHome.appendingPathComponent("Library/Keychains/login.keychain-db").path
+            environment["CCBOX_PREFS_NAMESPACE"] = "ccbox.\(envPrefix).\(appPrefix)"
             environment["CCBOX_SPOOF_LOCALE"] = "1"
             environment["LANG"] = "en_US.UTF-8"
             environment["LC_ALL"] = "en_US.UTF-8"

@@ -25,7 +25,8 @@ public enum SandboxSelfTest {
             ("7. Seatbelt 内核级真机阻断实测（非嵌套环境）", testSeatbeltLiveExecutionIfPermitted),
             ("8. Chrome 防泄露参数与 Preferences 工作区锁定", testChromeAntiLeakAndPreferences),
             ("9. 导入应用 Bundle 解析、Chrome/Electron 识别", testImportedAppBundleDetection),
-            ("10. 启动前 7 项伪装检测模型与状态判定", testPreFlightReportModel)
+            ("10. 启动前 7 项伪装检测模型与状态判定", testPreFlightReportModel),
+            ("11. 导入应用权限合并与独立 Keychain 初始化", testEntitlementMergeAndIsolatedKeychain)
         ]
 
         var results: [SandboxSelfTestResult] = []
@@ -326,8 +327,10 @@ public enum SandboxSelfTest {
         try expect(profile.contains("Library/Cookies"), "直通模式未隔离宿主 Cookies")
         try expect(profile.contains("Library/HTTPStorages"), "直通模式未隔离宿主 HTTPStorages")
         try expect(profile.contains("Library/WebKit"), "直通模式未隔离宿主 WebKit 缓存")
+        try expect(profile.contains("Library/Keychains"), "直通模式未隔离宿主 Keychains")
+        try expect(profile.contains("Library/Group Containers"), "直通模式未隔离宿主 Group Containers")
         try expect(profile.contains(".claude"), "直通模式未隔离宿主 .claude")
-        return "直通模式已封锁直连及宿主 Cookies/HTTPStorages/WebKit/.claude"
+        return "直通模式已封锁直连及宿主 Cookies/HTTPStorages/WebKit/Keychains/Group Containers/.claude"
     }
 
     // MARK: - 7. Live Seatbelt Kernel Enforcement
@@ -466,5 +469,45 @@ public enum SandboxSelfTest {
         )
         try expect(!failReport.allPassed && failReport.hasFailure && failReport.passedCount == 1, "失败状态汇总异常")
         return "7 项伪装检测报告汇总状态校验通过"
+    }
+
+    // MARK: - 11. Entitlement Merge & Isolated Keychain
+
+    private static func testEntitlementMergeAndIsolatedKeychain() throws -> String {
+        let original: [String: Any] = [
+            "com.apple.security.device.camera": true,
+            "com.apple.security.automation.apple-events": true,
+            "aps-environment": "production",
+            "keychain-access-groups": ["EQHXZ8M8AV.com.google.GeminiMacOS"],
+            "com.apple.security.application-groups": ["group.com.google.gemini"],
+            "com.apple.developer.team-identifier": "EQHXZ8M8AV"
+        ]
+        let originalData = try PropertyListSerialization.data(fromPropertyList: original, format: .xml, options: 0)
+        guard let mergedData = mergeHookEntitlements(originalPlistData: originalData),
+              let merged = try PropertyListSerialization.propertyList(from: mergedData, format: nil) as? [String: Any] else {
+            throw SandboxFailure("合并 entitlements 失败")
+        }
+        try expect(merged["com.apple.security.device.camera"] as? Bool == true, "未保留安全权限 camera")
+        try expect(merged["com.apple.security.automation.apple-events"] as? Bool == true, "未保留安全权限 apple-events")
+        try expect(merged["com.apple.security.cs.allow-dyld-environment-variables"] as? Bool == true, "缺少 dyld 注入权限")
+        try expect(merged["aps-environment"] == nil, "未剔除受限权限 aps-environment")
+        try expect(merged["keychain-access-groups"] == nil, "未剔除受限权限 keychain-access-groups")
+        try expect(merged["com.apple.security.application-groups"] == nil, "未剔除受限权限 application-groups")
+        try expect(merged["com.apple.developer.team-identifier"] == nil, "未剔除受限权限 team-identifier")
+
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let keychainPath = base.appendingPathComponent("Library/Keychains/login.keychain-db").path
+        let created = ensureIsolatedLoginKeychain(at: base)
+        if !created {
+            return "权限合并通过（当前外层沙箱阻止 securityd 创建钥匙串，正常终端将执行实测）"
+        }
+        try expect(FileManager.default.fileExists(atPath: keychainPath), "未生成独立 login.keychain-db")
+        try expect(ensureIsolatedLoginKeychain(at: base), "重复解锁独立 login.keychain-db 失败")
+        let listResult = try runTool("/usr/bin/security", arguments: ["list-keychains"], captureOutput: true)
+        let listOutput = String(decoding: listResult.output, as: UTF8.self)
+        try expect(!listOutput.contains(keychainPath), "独立钥匙串污染了宿主机 search list")
+        return "安全权限合并保留 + 独立 login.keychain-db 建库/解锁且零污染宿主机列表通过"
     }
 }

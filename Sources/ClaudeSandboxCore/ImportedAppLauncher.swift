@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 struct PreparedImportedApp: Sendable {
     let bundleURL: URL
@@ -62,36 +63,134 @@ func coboxURLHookDylibURL() -> URL? {
     return url
 }
 
-private let hookEntitlementsPlist = """
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-</dict>
-</plist>
-"""
+private let requiredHookEntitlements: [String: Any] = [
+    "com.apple.security.cs.allow-dyld-environment-variables": true,
+    "com.apple.security.cs.disable-library-validation": true,
+    "com.apple.security.cs.allow-unsigned-executable-memory": true,
+    "com.apple.security.cs.allow-jit": true
+]
+
+/// Entitlements that require a real Apple Developer TeamID / provisioning profile
+/// and will cause AMFI to SIGKILL an ad-hoc signed binary if retained.
+private func isRestrictedEntitlementKey(_ key: String) -> Bool {
+    if key == "aps-environment"
+        || key == "application-identifier"
+        || key == "com.apple.application-identifier"
+        || key == "keychain-access-groups"
+        || key == "com.apple.security.application-groups"
+        || key == "com.apple.security.app-sandbox"
+        || key == "com.apple.security.inherit" {
+        return true
+    }
+    let restrictedPrefixes = [
+        "com.apple.developer.",
+        "com.apple.private.",
+        "com.apple.security.temporary-exception.",
+        "com.apple.security.exception."
+    ]
+    return restrictedPrefixes.contains { key.hasPrefix($0) }
+}
+
+func mergeHookEntitlements(originalPlistData: Data?) -> Data? {
+    var merged: [String: Any] = [:]
+    if let originalPlistData,
+       let raw = try? PropertyListSerialization.propertyList(from: originalPlistData, format: nil) as? [String: Any] {
+        for (key, value) in raw where !isRestrictedEntitlementKey(key) {
+            merged[key] = value
+        }
+    }
+    for (key, value) in requiredHookEntitlements {
+        merged[key] = value
+    }
+    return try? PropertyListSerialization.data(fromPropertyList: merged, format: .xml, options: 0)
+}
+
+private func extractOriginalEntitlements(for executableURL: URL) -> Data? {
+    guard let result = try? runTool(
+        "/usr/bin/codesign",
+        arguments: ["-d", "--entitlements", ":-", executableURL.path],
+        captureOutput: true
+    ), result.status == 0, !result.output.isEmpty else {
+        return nil
+    }
+    return result.output
+}
 
 private func ensureHookableSignature(for executableURL: URL, targetDir: URL) {
-    let marker = targetDir.appendingPathComponent(".cobox-url-hook-v1")
+    let marker = targetDir.appendingPathComponent(".cobox-url-hook-v2")
     if FileManager.default.fileExists(atPath: marker.path) { return }
     let entitlementsURL = targetDir.appendingPathComponent(".cobox-hook-entitlements.plist")
     defer { try? FileManager.default.removeItem(at: entitlementsURL) }
-    guard (try? writePrivate(Data(hookEntitlementsPlist.utf8), to: entitlementsURL)) != nil else { return }
+    let originalEntitlements = extractOriginalEntitlements(for: executableURL)
+    guard let mergedData = mergeHookEntitlements(originalPlistData: originalEntitlements),
+          (try? writePrivate(mergedData, to: entitlementsURL)) != nil else {
+        return
+    }
     let result = try? runTool(
         "/usr/bin/codesign",
         arguments: ["--force", "--sign", "-", "--entitlements", entitlementsURL.path, executableURL.path]
     )
     if result?.status == 0 {
-        try? writePrivate(Data("1\n".utf8), to: marker)
+        try? writePrivate(Data("2\n".utf8), to: marker)
     }
+}
+
+/// Pre-creates and unlocks a dedicated file-based `login.keychain-db` inside the
+/// imported app's isolated `HOME` so `securityd` does not fail with `-25294`/`-60006`
+/// when the app persists OAuth tokens or keystore keys, without polluting the host
+/// user's global keychain search list.
+@discardableResult
+func ensureIsolatedLoginKeychain(at appHome: URL) -> Bool {
+    let keychainsDir = appHome.appendingPathComponent("Library/Keychains", isDirectory: true)
+    do {
+        try makePrivateDirectory(keychainsDir)
+    } catch {
+        return false
+    }
+    let keychainURL = keychainsDir.appendingPathComponent("login.keychain-db")
+    let password = "ccbox-isolated-keychain"
+
+    // Snapshot the user's current keychain search list so we can restore it if needed.
+    var originalSearchList: CFArray?
+    let hasOriginalList = SecKeychainCopySearchList(&originalSearchList) == errSecSuccess
+
+    var keychain: SecKeychain?
+    let status: OSStatus
+    if FileManager.default.fileExists(atPath: keychainURL.path) {
+        status = SecKeychainOpen(keychainURL.path, &keychain)
+    } else {
+        status = password.withCString { cstr in
+            SecKeychainCreate(
+                keychainURL.path,
+                UInt32(strlen(cstr)),
+                cstr,
+                false,
+                nil,
+                &keychain
+            )
+        }
+    }
+
+    if hasOriginalList, let list = originalSearchList {
+        _ = SecKeychainSetSearchList(list)
+    }
+
+    guard status == errSecSuccess, let kc = keychain else {
+        return false
+    }
+
+    var settings = SecKeychainSettings(
+        version: UInt32(SEC_KEYCHAIN_SETTINGS_VERS1),
+        lockOnSleep: DarwinBoolean(false),
+        useLockInterval: DarwinBoolean(false),
+        lockInterval: UInt32.max
+    )
+    _ = SecKeychainSetSettings(kc, &settings)
+
+    let unlockStatus: OSStatus = password.withCString { cstr in
+        SecKeychainUnlock(kc, UInt32(strlen(cstr)), cstr, true)
+    }
+    return unlockStatus == errSecSuccess
 }
 
 func prepareImportedAppBundle(_ app: SandboxImportedApp, storeRoot: URL) async throws -> PreparedImportedApp {

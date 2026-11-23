@@ -2,6 +2,8 @@
 #import <CFNetwork/CFNetwork.h>
 #import <CoreServices/CoreServices.h>
 #import <Network/Network.h>
+#import <Security/Security.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #import <objc/runtime.h>
 #import <arpa/inet.h>
 #import <netinet/in.h>
@@ -39,6 +41,71 @@ static NSDictionary *coboxProxyDictionary(void) {
     dict[(NSString *)kCFNetworkProxiesExceptionsList] = @[@"localhost", @"127.0.0.1", @"::1"];
     dict[(NSString *)kCFNetworkProxiesExcludeSimpleHostnames] = @YES;
     return [dict copy];
+}
+
+static NSString *coboxPrefsNamespace(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *env = getenv("CCBOX_PREFS_NAMESPACE");
+        if (env && env[0] != '\0') {
+            cached = [[NSString stringWithUTF8String:env] copy];
+        }
+    });
+    return cached;
+}
+
+static NSString *coboxMainBundleIdentifier(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        if (bid.length > 0) {
+            cached = [bid copy];
+        } else {
+            NSString *proc = [[NSProcessInfo processInfo] processName];
+            cached = (proc.length > 0) ? [proc copy] : @"app";
+        }
+    });
+    return cached;
+}
+
+static BOOL coboxIsSystemPrefsDomain(NSString *domain) {
+    if (domain.length == 0) return YES;
+    if ([domain isEqualToString:NSGlobalDomain] ||
+        [domain isEqualToString:@"Apple Global Domain"] ||
+        [domain isEqualToString:@".GlobalPreferences"] ||
+        [domain isEqualToString:NSArgumentDomain] ||
+        [domain isEqualToString:NSRegistrationDomain] ||
+        [domain isEqualToString:(NSString *)kCFPreferencesAnyApplication]) {
+        return YES;
+    }
+    if ([domain hasPrefix:@"com.apple."] || [domain hasPrefix:@"Apple "] || [domain hasPrefix:@"."]) {
+        return YES;
+    }
+    return NO;
+}
+
+static NSString *coboxNamespacedPrefsDomain(NSString *domain) {
+    NSString *ns = coboxPrefsNamespace();
+    if (ns.length == 0 || domain.length == 0) return domain;
+    if (coboxIsSystemPrefsDomain(domain)) return domain;
+    NSString *prefix = [ns stringByAppendingString:@"."];
+    if ([domain hasPrefix:prefix]) return domain;
+    return [prefix stringByAppendingString:domain];
+}
+
+static CFStringRef coboxNamespacedCFApplicationID(CFStringRef applicationID) {
+    NSString *ns = coboxPrefsNamespace();
+    if (ns.length == 0 || applicationID == NULL) return applicationID;
+    if (CFEqual(applicationID, kCFPreferencesAnyApplication)) return applicationID;
+    if (CFEqual(applicationID, kCFPreferencesCurrentApplication)) {
+        NSString *rewritten = coboxNamespacedPrefsDomain(coboxMainBundleIdentifier());
+        return (__bridge CFStringRef)rewritten;
+    }
+    NSString *nsDomain = (__bridge NSString *)applicationID;
+    NSString *rewritten = coboxNamespacedPrefsDomain(nsDomain);
+    return (__bridge CFStringRef)rewritten;
 }
 
 static NSArray<NSString *> *coboxAllowedPaths(void) {
@@ -215,7 +282,7 @@ additionalEventParamDescriptor:(NSAppleEventDescriptor *)descriptor
 
 @end
 
-// MARK: - 2. Native Network Proxy Injection (NSURLSession + CFNetwork + WKWebView)
+// MARK: - 2. Native Network Proxy Injection (NSURLSession + CFNetwork + SCDynamicStore + WKWebView)
 
 @implementation NSURLSessionConfiguration (CoboxProxyHook)
 
@@ -235,6 +302,24 @@ additionalEventParamDescriptor:(NSAppleEventDescriptor *)descriptor
         config.connectionProxyDictionary = proxy;
     }
     return config;
+}
+
++ (NSURLSessionConfiguration *)cobox_backgroundSessionConfigurationWithIdentifier:(NSString *)identifier {
+    NSURLSessionConfiguration *config = [self cobox_backgroundSessionConfigurationWithIdentifier:identifier];
+    NSDictionary *proxy = coboxProxyDictionary();
+    if (proxy) {
+        config.connectionProxyDictionary = proxy;
+    }
+    return config;
+}
+
+- (void)cobox_setConnectionProxyDictionary:(NSDictionary *)connectionProxyDictionary {
+    NSDictionary *proxy = coboxProxyDictionary();
+    if (proxy) {
+        [self cobox_setConnectionProxyDictionary:proxy];
+        return;
+    }
+    [self cobox_setConnectionProxyDictionary:connectionProxyDictionary];
 }
 
 @end
@@ -273,7 +358,60 @@ static id cobox_WKConfigInit(id self, SEL _cmd) {
     return instance;
 }
 
-// MARK: - 3. Locale Spoofing (NSLocale)
+// MARK: - 3. NSUserDefaults & App Group Container Isolation
+
+@implementation NSUserDefaults (CoboxPrefsIsolation)
+
++ (NSUserDefaults *)cobox_standardUserDefaults {
+    NSString *ns = coboxPrefsNamespace();
+    if (ns.length == 0) {
+        return [self cobox_standardUserDefaults];
+    }
+    static NSUserDefaults *isolatedStandard = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *suite = coboxNamespacedPrefsDomain(coboxMainBundleIdentifier());
+        // Calls the swizzled initWithSuiteName:, which preserves already-prefixed domains.
+        isolatedStandard = [[NSUserDefaults alloc] initWithSuiteName:suite];
+        const char *spoof = getenv("CCBOX_SPOOF_LOCALE");
+        if (isolatedStandard && spoof && spoof[0] == '1') {
+            [isolatedStandard registerDefaults:@{
+                @"AppleLanguages": @[@"en-US", @"en"],
+                @"AppleLocale": @"en_US"
+            }];
+        }
+    });
+    return isolatedStandard ?: [self cobox_standardUserDefaults];
+}
+
+- (instancetype)cobox_initWithSuiteName:(NSString *)suitename {
+    NSString *rewritten = coboxNamespacedPrefsDomain(suitename);
+    return [self cobox_initWithSuiteName:rewritten];
+}
+
+@end
+
+@implementation NSFileManager (CoboxGroupContainerIsolation)
+
+- (NSURL *)cobox_containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+    const char *appHomeEnv = getenv("CCBOX_APP_HOME");
+    if (appHomeEnv && appHomeEnv[0] != '\0' && groupIdentifier.length > 0 && ![groupIdentifier containsString:@".."]) {
+        NSString *sanitized = [groupIdentifier stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+        NSString *basePath = [[NSString stringWithUTF8String:appHomeEnv]
+                              stringByAppendingPathComponent:@"Library/Group Containers"];
+        NSString *groupPath = [basePath stringByAppendingPathComponent:sanitized];
+        [[NSFileManager defaultManager] createDirectoryAtPath:groupPath
+                                  withIntermediateDirectories:YES
+                                                   attributes:@{NSFilePosixPermissions: @0700}
+                                                        error:nil];
+        return [NSURL fileURLWithPath:groupPath isDirectory:YES];
+    }
+    return [self cobox_containerURLForSecurityApplicationGroupIdentifier:groupIdentifier];
+}
+
+@end
+
+// MARK: - 4. Locale Spoofing (NSLocale)
 
 @implementation NSLocale (CoboxLocaleHook)
 
@@ -287,7 +425,7 @@ static id cobox_WKConfigInit(id self, SEL _cmd) {
 
 @end
 
-// MARK: - 4. File Picker Sandbox Path Enforcement (NSOpenPanel / NSSavePanel)
+// MARK: - 5. File Picker Sandbox Path Enforcement (NSOpenPanel / NSSavePanel)
 
 static const void *kCoboxPanelGuardKey = &kCoboxPanelGuardKey;
 
@@ -416,6 +554,84 @@ static void coboxGuardSavePanel(NSSavePanel *panel) {
 
 @end
 
+// MARK: - 6. In-Process Isolated Keychain Unlock & SecItem Redirection
+
+static SecKeychainRef coboxIsolatedKeychain(void) {
+    static SecKeychainRef cached = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *kcPath = getenv("CCBOX_ISOLATED_KEYCHAIN");
+        if (!kcPath || kcPath[0] == '\0') return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        SecKeychainRef kc = NULL;
+        if (SecKeychainOpen(kcPath, &kc) == errSecSuccess && kc != NULL) {
+            const char *pw = "ccbox-isolated-keychain";
+            SecKeychainUnlock(kc, (UInt32)strlen(pw), pw, true);
+            cached = kc;
+        }
+#pragma clang diagnostic pop
+    });
+    return cached;
+}
+
+static void coboxEnsureChildKeychainUnlocked(void) {
+    (void)coboxIsolatedKeychain();
+}
+
+static BOOL coboxShouldRedirectSecItemQuery(CFDictionaryRef query) {
+    if (query == NULL) return NO;
+    CFTypeRef secClass = CFDictionaryGetValue(query, kSecClass);
+    if (secClass == NULL) {
+        return CFDictionaryContainsKey(query, kSecUseDataProtectionKeychain) ||
+               CFDictionaryContainsKey(query, kSecAttrAccessGroup);
+    }
+    if (CFEqual(secClass, kSecClassCertificate) || CFEqual(secClass, kSecClassIdentity)) {
+        return NO;
+    }
+    return CFEqual(secClass, kSecClassGenericPassword) ||
+           CFEqual(secClass, kSecClassInternetPassword) ||
+           CFEqual(secClass, kSecClassKey);
+}
+
+static CFDictionaryRef coboxRewriteSecItemQuery(CFDictionaryRef query, BOOL isAdd) {
+    SecKeychainRef kc = coboxIsolatedKeychain();
+    if (kc == NULL || !coboxShouldRedirectSecItemQuery(query)) {
+        return NULL;
+    }
+    CFMutableDictionaryRef mutable = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, query);
+    if (mutable == NULL) return NULL;
+    CFDictionaryRemoveValue(mutable, kSecUseDataProtectionKeychain);
+    CFDictionaryRemoveValue(mutable, kSecAttrAccessGroup);
+    CFDictionaryRemoveValue(mutable, kSecAttrSynchronizable);
+    if (isAdd) {
+        CFDictionarySetValue(mutable, kSecUseKeychain, kc);
+    } else {
+        const void *values[1] = { kc };
+        CFArrayRef searchList = CFArrayCreate(kCFAllocatorDefault, values, 1, &kCFTypeArrayCallBacks);
+        if (searchList != NULL) {
+            CFDictionarySetValue(mutable, kSecMatchSearchList, searchList);
+            CFRelease(searchList);
+        }
+    }
+    return mutable;
+}
+
+static CFDictionaryRef coboxSanitizeSecItemAttributes(CFDictionaryRef attrs) {
+    if (attrs == NULL || coboxIsolatedKeychain() == NULL) return NULL;
+    if (!CFDictionaryContainsKey(attrs, kSecUseDataProtectionKeychain) &&
+        !CFDictionaryContainsKey(attrs, kSecAttrAccessGroup) &&
+        !CFDictionaryContainsKey(attrs, kSecAttrSynchronizable)) {
+        return NULL;
+    }
+    CFMutableDictionaryRef mutable = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attrs);
+    if (mutable == NULL) return NULL;
+    CFDictionaryRemoveValue(mutable, kSecUseDataProtectionKeychain);
+    CFDictionaryRemoveValue(mutable, kSecAttrAccessGroup);
+    CFDictionaryRemoveValue(mutable, kSecAttrSynchronizable);
+    return mutable;
+}
+
 // MARK: - Swizzle & Interpose Installation
 
 static void coboxSwizzleInstance(Class cls, SEL originalSel, SEL swizzledSel) {
@@ -436,6 +652,9 @@ static void coboxSwizzleClass(Class cls, SEL originalSel, SEL swizzledSel) {
 
 __attribute__((constructor))
 static void coboxInstallHooks(void) {
+    // 0. Ensure isolated login.keychain-db is unlocked inside child process
+    coboxEnsureChildKeychainUnlocked();
+
     // 1. Browser URL redirection
     if (coboxEnvPort("CLAUDE_SANDBOX_BROWSER_PORT") > 0) {
         Class ws = [NSWorkspace class];
@@ -453,6 +672,10 @@ static void coboxInstallHooks(void) {
         Class sessionCfg = [NSURLSessionConfiguration class];
         coboxSwizzleClass(sessionCfg, @selector(defaultSessionConfiguration), @selector(cobox_defaultSessionConfiguration));
         coboxSwizzleClass(sessionCfg, @selector(ephemeralSessionConfiguration), @selector(cobox_ephemeralSessionConfiguration));
+        coboxSwizzleClass(sessionCfg, @selector(backgroundSessionConfigurationWithIdentifier:),
+                          @selector(cobox_backgroundSessionConfigurationWithIdentifier:));
+        coboxSwizzleInstance(sessionCfg, @selector(setConnectionProxyDictionary:),
+                             @selector(cobox_setConnectionProxyDictionary:));
 
         Class wkConfigClass = NSClassFromString(@"WKWebViewConfiguration");
         if (wkConfigClass) {
@@ -464,13 +687,28 @@ static void coboxInstallHooks(void) {
         }
     }
 
-    // 3. Locale spoofing
+    // 3. NSUserDefaults namespace isolation
+    if (coboxPrefsNamespace().length > 0) {
+        Class defaultsCls = [NSUserDefaults class];
+        coboxSwizzleClass(defaultsCls, @selector(standardUserDefaults), @selector(cobox_standardUserDefaults));
+        coboxSwizzleInstance(defaultsCls, @selector(initWithSuiteName:), @selector(cobox_initWithSuiteName:));
+    }
+
+    // 4. App Group Container redirection
+    const char *appHomeEnv = getenv("CCBOX_APP_HOME");
+    if (appHomeEnv && appHomeEnv[0] != '\0') {
+        coboxSwizzleInstance([NSFileManager class],
+                             @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                             @selector(cobox_containerURLForSecurityApplicationGroupIdentifier:));
+    }
+
+    // 5. Locale spoofing
     const char *spoof = getenv("CCBOX_SPOOF_LOCALE");
     if (spoof && spoof[0] == '1') {
         coboxSwizzleClass([NSLocale class], @selector(preferredLanguages), @selector(cobox_preferredLanguages));
     }
 
-    // 4. File picker path restriction
+    // 6. File picker path restriction
     if (getenv("CCBOX_SANDBOX_WORKSPACE") != NULL || coboxAllowedPaths().count > 0) {
         Class savePanel = [NSSavePanel class];
         coboxSwizzleInstance(savePanel, @selector(runModal), @selector(cobox_runModal));
@@ -482,6 +720,8 @@ static void coboxInstallHooks(void) {
         coboxSwizzleInstance(openPanel, @selector(URLs), @selector(cobox_URLs));
     }
 }
+
+// MARK: - DYLD Interpose C Hooks
 
 static OSStatus cobox_LSOpenCFURLRef(CFURLRef inURL, CFURLRef *outLaunchedURL) {
     NSURL *nsURL = (__bridge NSURL *)inURL;
@@ -500,6 +740,38 @@ static CFDictionaryRef cobox_CFNetworkCopySystemProxySettings(void) {
     return CFNetworkCopySystemProxySettings();
 }
 
+static CFDictionaryRef cobox_SCDynamicStoreCopyProxies(SCDynamicStoreRef store) {
+    NSDictionary *proxy = coboxProxyDictionary();
+    if (proxy) {
+        return (__bridge_retained CFDictionaryRef)proxy;
+    }
+    return SCDynamicStoreCopyProxies(store);
+}
+
+static CFPropertyListRef cobox_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef applicationID) {
+    return CFPreferencesCopyAppValue(key, coboxNamespacedCFApplicationID(applicationID));
+}
+
+static void cobox_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef applicationID) {
+    CFPreferencesSetAppValue(key, value, coboxNamespacedCFApplicationID(applicationID));
+}
+
+static Boolean cobox_CFPreferencesAppSynchronize(CFStringRef applicationID) {
+    return CFPreferencesAppSynchronize(coboxNamespacedCFApplicationID(applicationID));
+}
+
+static CFPropertyListRef cobox_CFPreferencesCopyValue(CFStringRef key, CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
+    return CFPreferencesCopyValue(key, coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+}
+
+static void cobox_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
+    CFPreferencesSetValue(key, value, coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+}
+
+static Boolean cobox_CFPreferencesSynchronize(CFStringRef applicationID, CFStringRef userName, CFStringRef hostName) {
+    return CFPreferencesSynchronize(coboxNamespacedCFApplicationID(applicationID), userName, hostName);
+}
+
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { \
         const void *replacement; \
@@ -511,3 +783,45 @@ static CFDictionaryRef cobox_CFNetworkCopySystemProxySettings(void) {
 
 DYLD_INTERPOSE(cobox_LSOpenCFURLRef, LSOpenCFURLRef)
 DYLD_INTERPOSE(cobox_CFNetworkCopySystemProxySettings, CFNetworkCopySystemProxySettings)
+DYLD_INTERPOSE(cobox_SCDynamicStoreCopyProxies, SCDynamicStoreCopyProxies)
+DYLD_INTERPOSE(cobox_CFPreferencesCopyAppValue, CFPreferencesCopyAppValue)
+DYLD_INTERPOSE(cobox_CFPreferencesSetAppValue, CFPreferencesSetAppValue)
+DYLD_INTERPOSE(cobox_CFPreferencesAppSynchronize, CFPreferencesAppSynchronize)
+DYLD_INTERPOSE(cobox_CFPreferencesCopyValue, CFPreferencesCopyValue)
+static OSStatus cobox_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    CFDictionaryRef rewritten = coboxRewriteSecItemQuery(attributes, YES);
+    OSStatus status = SecItemAdd(rewritten ? rewritten : attributes, result);
+    if (rewritten) CFRelease(rewritten);
+    return status;
+}
+
+static OSStatus cobox_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    CFDictionaryRef rewritten = coboxRewriteSecItemQuery(query, NO);
+    OSStatus status = SecItemCopyMatching(rewritten ? rewritten : query, result);
+    if (rewritten) CFRelease(rewritten);
+    return status;
+}
+
+static OSStatus cobox_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    CFDictionaryRef rewrittenQuery = coboxRewriteSecItemQuery(query, NO);
+    CFDictionaryRef sanitizedAttrs = coboxSanitizeSecItemAttributes(attributesToUpdate);
+    OSStatus status = SecItemUpdate(rewrittenQuery ? rewrittenQuery : query,
+                                    sanitizedAttrs ? sanitizedAttrs : attributesToUpdate);
+    if (rewrittenQuery) CFRelease(rewrittenQuery);
+    if (sanitizedAttrs) CFRelease(sanitizedAttrs);
+    return status;
+}
+
+static OSStatus cobox_SecItemDelete(CFDictionaryRef query) {
+    CFDictionaryRef rewritten = coboxRewriteSecItemQuery(query, NO);
+    OSStatus status = SecItemDelete(rewritten ? rewritten : query);
+    if (rewritten) CFRelease(rewritten);
+    return status;
+}
+
+DYLD_INTERPOSE(cobox_CFPreferencesSetValue, CFPreferencesSetValue)
+DYLD_INTERPOSE(cobox_CFPreferencesSynchronize, CFPreferencesSynchronize)
+DYLD_INTERPOSE(cobox_SecItemAdd, SecItemAdd)
+DYLD_INTERPOSE(cobox_SecItemCopyMatching, SecItemCopyMatching)
+DYLD_INTERPOSE(cobox_SecItemUpdate, SecItemUpdate)
+DYLD_INTERPOSE(cobox_SecItemDelete, SecItemDelete)
