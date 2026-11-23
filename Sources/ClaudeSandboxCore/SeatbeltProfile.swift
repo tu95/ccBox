@@ -66,3 +66,60 @@ func seatbeltProfile(
 
     return lines.joined(separator: "\n") + "\n"
 }
+
+func importedAppSeatbeltProfile(
+    workspace: URL,
+    source: URL,
+    store: SandboxStore,
+    runtime: URL,
+    shellStartup: URL,
+    appBundle: URL,
+    appRoot: URL,
+    appTemp: URL,
+    hookDylib: URL?,
+    isolationMode: SandboxIsolationMode
+) -> String {
+    let homeURL = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath()
+    let home = homeURL.path
+    var lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        "(allow system-socket (socket-domain AF_UNIX))",
+        "(allow network-bind (local unix-socket (path-regex #\"^/\")))",
+        "(allow network-inbound (local unix-socket (path-regex #\"^/\")))",
+        "(allow network-outbound (remote unix-socket (path-regex #\"^/\")))",
+        "(allow network-bind (local ip \"*:*\"))",
+        "(allow network-inbound (local ip \"*:*\"))",
+        "(allow network-outbound (remote ip \"localhost:*\"))"
+    ]
+
+    var readOnly = [shellStartup.path, appBundle.path]
+    if let hookDylib {
+        readOnly.append(hookDylib.deletingLastPathComponent().path)
+    }
+
+    switch isolationMode {
+    case .isolated:
+        let denied = ["/Users", "/Volumes", home, store.root.path, runtime.path, source.path]
+        let readWrite = [workspace.path, appRoot.path, appTemp.path]
+        lines.append("(deny file-read* file-write*\n\(sbplSubpaths(denied)))")
+        lines.append("(allow file-read-metadata)")
+        lines.append("(allow file-read* file-write*\n\(sbplSubpaths(readWrite)))")
+        lines.append("(allow file-read*\n\(sbplSubpaths(readOnly)))")
+    case .hostPassthrough:
+        let claudeDir = homeURL.appendingPathComponent(".claude").path
+        let claudeFile = homeURL.appendingPathComponent(".claude.json").path
+        let hostCookies = homeURL.appendingPathComponent("Library/Cookies").path
+        let hostHTTPStorage = homeURL.appendingPathComponent("Library/HTTPStorages").path
+        let hostWebKit = homeURL.appendingPathComponent("Library/WebKit").path
+        let deniedSubpaths = [claudeDir, hostCookies, hostHTTPStorage, hostWebKit, store.root.path, runtime.path]
+        let readWrite = [workspace.path, appRoot.path, appTemp.path]
+        lines.append("(deny file-read* file-write*\n\(sbplSubpaths(deniedSubpaths))\n  (literal \(sbplString(claudeFile))))")
+        lines.append("(allow file-read-metadata)")
+        lines.append("(allow file-read* file-write*\n\(sbplSubpaths(readWrite)))")
+        lines.append("(allow file-read*\n\(sbplSubpaths(readOnly)))")
+    }
+
+    return lines.joined(separator: "\n") + "\n"
+}

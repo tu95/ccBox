@@ -3,12 +3,23 @@ import AppKit
 import UniformTypeIdentifiers
 import ClaudeSandboxCore
 
+enum SandboxLaunchTarget {
+    case session
+    case terminal
+    case chrome
+    case imported(SandboxImportedApp)
+}
+
 @MainActor
 final class EnvironmentSession {
     let id: UUID
     let runner: SandboxRunner
     let terminal = SandboxTerminal()
-    var isRunning = false
+    var launch: SandboxLaunch?
+    var isRunning: Bool { launch != nil }
+    var isTerminalRunning = false
+    var hasTerminalTab = false
+    var showsTerminal = false
     var isStarting = false
     var isProxyRunning = false
     var isProxyStarting = false
@@ -20,6 +31,7 @@ final class EnvironmentSession {
     var resolvedTimeZone = "自动"
     var exitIP: String?
     var inspectedExit: SandboxExit?
+    var checkReport: ProxyCheckReport?
     var isInspectingExit = false
     var terminalColumns: UInt16 = 100
     var terminalRows: UInt16 = 30
@@ -57,7 +69,7 @@ final class DashboardModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.stopAll()
             }
         }
@@ -85,17 +97,8 @@ final class DashboardModel: ObservableObject {
         let id = environment.id
         created.terminal.onExit = { [weak self, weak created] code in
             guard let self, let created else { return }
-            if let pid = created.runner.browserProcessIdentifier { self.borderOverlay.unregister(pid: pid) }
-            for pid in created.runner.runningImportedAppPIDs { self.borderOverlay.unregister(pid: pid) }
-            created.runner.stop()
-            created.isRunning = false
-            created.isProxyRunning = false
-            created.isChromeRunning = false
-            created.runningAppIDs.removeAll()
-            created.startingAppIDs.removeAll()
-            if created.proxyState != "代理异常退出" {
-                created.proxyState = "会话已结束"
-            }
+            created.isTerminalRunning = false
+            guard created.isRunning else { return }
             if self.selectedID == id {
                 self.notice = "沙箱 shell 已退出（\(code)）"
             }
@@ -106,7 +109,7 @@ final class DashboardModel: ObservableObject {
             if let pid = created.runner.browserProcessIdentifier { self.borderOverlay.unregister(pid: pid) }
             for pid in created.runner.runningImportedAppPIDs { self.borderOverlay.unregister(pid: pid) }
             created.terminal.stop()
-            created.isRunning = false
+            created.launch = nil
             created.isProxyRunning = false
             created.isChromeRunning = false
             created.runningAppIDs.removeAll()
@@ -141,11 +144,14 @@ final class DashboardModel: ObservableObject {
             self.borderOverlay.register(pid: pid, accentHex: environment.resolvedAccentHex)
             self.objectWillChange.send()
         }
-        created.runner.onAppExit = { [weak self, weak created] appID, pid, _ in
+        created.runner.onAppExit = { [weak self, weak created] appID, pid, status in
             guard let self, let created else { return }
             created.runningAppIDs.remove(appID)
             created.startingAppIDs.remove(appID)
             self.borderOverlay.unregister(pid: pid)
+            if status != 0, let app = self.environments.first(where: { $0.id == id })?.importedApps.first(where: { $0.id == appID }) {
+                self.errorMessage = "\(app.name) 已异常退出（退出码 \(status)）。"
+            }
             self.objectWillChange.send()
         }
         sessions[id] = created
@@ -170,6 +176,21 @@ final class DashboardModel: ObservableObject {
     }
 
     var isRunning: Bool { activeSession?.isRunning ?? false }
+    var isTerminalRunning: Bool { activeSession?.isTerminalRunning ?? false }
+    var hasTerminalTab: Bool { activeSession?.hasTerminalTab ?? false }
+    var showsTerminal: Bool { activeSession?.showsTerminal ?? false }
+
+    func showApps(closingTerminalTab: Bool = false) {
+        activeSession?.showsTerminal = false
+        if closingTerminalTab { activeSession?.hasTerminalTab = false }
+        objectWillChange.send()
+    }
+
+    func showTerminal() {
+        activeSession?.hasTerminalTab = true
+        activeSession?.showsTerminal = true
+        objectWillChange.send()
+    }
     var isStarting: Bool { activeSession?.isStarting ?? false }
     var isProxyRunning: Bool { activeSession?.isProxyRunning ?? false }
     var isProxyStarting: Bool { activeSession?.isProxyStarting ?? false }
@@ -179,6 +200,7 @@ final class DashboardModel: ObservableObject {
     var resolvedTimeZone: String { activeSession?.resolvedTimeZone ?? (selected?.timeZoneIdentifier ?? "自动") }
     var exitIP: String? { activeSession?.exitIP }
     var inspectedExit: SandboxExit? { activeSession?.inspectedExit }
+    var checkReport: ProxyCheckReport? { activeSession?.checkReport }
     var isInspectingExit: Bool { activeSession?.isInspectingExit ?? false }
 
     func updateTerminalSize(for id: UUID, columns: UInt16, rows: UInt16) {
@@ -189,7 +211,8 @@ final class DashboardModel: ObservableObject {
     func startDemoIfNeeded() {
         guard demoPending else { return }
         demoPending = false
-        start()
+        showTerminal()
+        start(.terminal)
     }
 
     var selected: SandboxEnvironment? {
@@ -251,6 +274,7 @@ final class DashboardModel: ObservableObject {
         guard updatedEnv.node != node else { return }
         updatedEnv.node = node
         current.inspectedExit = nil
+        current.checkReport = nil
         current.exitIP = nil
         guard let index = environments.firstIndex(where: { $0.id == updatedEnv.id }) else { return }
         var updated = environments
@@ -308,6 +332,7 @@ final class DashboardModel: ObservableObject {
         do {
             let current = session(for: environment)
             current.inspectedExit = nil
+            current.checkReport = nil
             current.exitIP = nil
             let freshNodes = try store.nodes(for: environment)
             if selectedID == environment.id {
@@ -337,10 +362,14 @@ final class DashboardModel: ObservableObject {
         guard !current.isRunning, !current.isStarting, !current.isProxyRunning, !current.isProxyStarting, !current.isInspectingExit else { return }
         current.isInspectingExit = true
         current.inspectedExit = nil
+        current.checkReport = nil
         objectWillChange.send()
         Task {
-            do { current.inspectedExit = try await current.runner.inspectExit(selected) }
-            catch { errorMessage = "出口检测失败：\(error.localizedDescription)" }
+            do {
+                let exit = try await current.runner.inspectExit(selected)
+                current.inspectedExit = exit
+                current.checkReport = exit.checkReport
+            } catch { errorMessage = "出口检测失败：\(error.localizedDescription)" }
             current.isInspectingExit = false
             objectWillChange.send()
         }
@@ -356,11 +385,12 @@ final class DashboardModel: ObservableObject {
         objectWillChange.send()
         Task {
             do {
-                try await current.runner.startProxyOnly(selected)
+                let report = try await current.runner.startProxyOnly(selected)
+                current.checkReport = report
                 current.isProxyRunning = true
                 current.proxyState = "代理已启动 · \(selected.node ?? "节点")"
                 if selectedID == selected.id {
-                    notice = "代理已启动。现在可以启动沙箱 shell。"
+                    notice = "代理已启动。现在可以打开沙箱应用。"
                 }
             } catch {
                 current.runner.stop()
@@ -383,25 +413,6 @@ final class DashboardModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func startChrome() {
-        guard let selected else { return }
-        let current = session(for: selected)
-        guard current.isRunning, current.isProxyRunning, !current.isChromeRunning, !current.isChromeStarting else { return }
-        current.isChromeStarting = true
-        objectWillChange.send()
-        Task {
-            do {
-                try await current.runner.startChrome()
-                current.isChromeRunning = true
-                if selectedID == selected.id { notice = nil }
-            } catch {
-                errorMessage = "启动隔离版 Chrome 失败：\(error.localizedDescription)"
-            }
-            current.isChromeStarting = false
-            objectWillChange.send()
-        }
-    }
-
     func stopChrome() {
         guard let selected else { return }
         let current = session(for: selected)
@@ -413,44 +424,117 @@ final class DashboardModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func start() {
+    func start(_ target: SandboxLaunchTarget = .session) {
         guard let selected else { return }
         let current = session(for: selected)
-        guard !current.isStarting, !current.isRunning, !isImporting, !current.isInspectingExit else { return }
-        current.isStarting = true
-        current.inspectedExit = nil
-        current.exitIP = nil
-        current.proxyState = selected.node == nil ? "正在启动 Seatbelt…" : "正在启动 mihomo 和 Seatbelt…"
+
+        switch target {
+        case .session, .terminal:
+            break
+        case .chrome:
+            if let pid = current.runner.browserProcessIdentifier {
+                NSRunningApplication(processIdentifier: pid)?.activate()
+                return
+            }
+            guard !current.isChromeStarting else { return }
+        case .imported(let app):
+            if let pid = current.runner.appProcessIdentifier(for: app.id) {
+                NSRunningApplication(processIdentifier: pid)?.activate()
+                return
+            }
+            guard !current.startingAppIDs.contains(app.id) else { return }
+        }
+        guard !current.isStarting, !current.isProxyStarting, !isImporting, !current.isInspectingExit else { return }
+
+        switch target {
+        case .session, .terminal:
+            break
+        case .chrome, .imported:
+            guard selected.node != nil else {
+                errorMessage = "请先在左侧导入并选择代理节点，再打开沙箱应用。"
+                return
+            }
+        }
+
+        let needsSession = !current.isRunning
+        if needsSession {
+            current.isStarting = true
+            current.inspectedExit = nil
+            current.checkReport = nil
+            current.exitIP = nil
+            current.proxyState = selected.node == nil ? "正在启动 Seatbelt…" : "正在启动 mihomo 并执行伪装检测…"
+        }
+        switch target {
+        case .session, .terminal: break
+        case .chrome: current.isChromeStarting = true
+        case .imported(let app): current.startingAppIDs.insert(app.id)
+        }
         objectWillChange.send()
+
         Task {
-            do {
-                let launch = try await current.runner.start(selected)
-                try current.terminal.start(launch, columns: current.terminalColumns, rows: current.terminalRows)
-                current.isRunning = true
-                current.isProxyRunning = launch.endpoint != nil
-                current.resolvedTimeZone = launch.timeZoneIdentifier
-                current.exitIP = launch.exitIP
-                let ipText = launch.exitIP.map { " · 出口 \($0)" } ?? ""
-                if let endpoint = launch.endpoint {
-                    let zoneFallback = selected.timeZoneIdentifier == nil && launch.exitIP == nil
-                    current.proxyState = "Seatbelt · mihomo \(endpoint) · \(launch.timeZoneIdentifier)\(ipText)\(zoneFallback ? " · 时区暂用本机值" : "")"
-                } else {
-                    current.proxyState = "Seatbelt · 已断网"
+            defer {
+                switch target {
+                case .session, .terminal: break
+                case .chrome: current.isChromeStarting = false
+                case .imported(let app): current.startingAppIDs.remove(app.id)
                 }
-                if selectedID == selected.id {
-                    if selected.node != nil && selected.timeZoneIdentifier == nil && launch.exitIP == nil {
-                        notice = "沙箱 shell 已启动。出口时区查询失败，暂用本机时区 \(launch.timeZoneIdentifier)；可在左侧手动指定。"
+                objectWillChange.send()
+            }
+
+            if needsSession {
+                do {
+                    let launch = try await current.runner.start(selected)
+                    current.launch = launch
+                    current.isProxyRunning = launch.endpoint != nil
+                    current.resolvedTimeZone = launch.timeZoneIdentifier
+                    current.exitIP = launch.exitIP
+                    current.checkReport = launch.checkReport
+                    if let endpoint = launch.endpoint {
+                        let ipText = launch.exitIP.map { " · 出口 \($0)" } ?? ""
+                        let fallback = selected.timeZoneIdentifier == nil && launch.exitIP == nil ? " · 时区暂用本机值" : ""
+                        current.proxyState = "Seatbelt · mihomo \(endpoint) · \(launch.timeZoneIdentifier)\(ipText)\(fallback)"
                     } else {
-                        notice = "沙箱 shell 已启动"
+                        current.proxyState = "Seatbelt · 已断网"
+                    }
+                } catch {
+                    current.runner.stop()
+                    current.isProxyRunning = false
+                    current.proxyState = "启动失败"
+                    if !(error is CancellationError) {
+                        errorMessage = "启动沙箱失败：\(error.localizedDescription)"
                     }
                 }
-            } catch {
-                current.runner.stop()
-                current.proxyState = "启动失败"
-                errorMessage = "启动失败：\(error.localizedDescription)"
+                current.isStarting = false
+                objectWillChange.send()
             }
-            current.isStarting = false
-            objectWillChange.send()
+
+            guard let launch = current.launch else { return }
+            do {
+                switch target {
+                case .session:
+                    break
+                case .terminal:
+                    guard !current.isTerminalRunning else { return }
+                    try current.terminal.start(launch, columns: current.terminalColumns, rows: current.terminalRows)
+                    current.isTerminalRunning = true
+                case .chrome:
+                    try await current.runner.startChrome()
+                case .imported(let app):
+                    try await current.runner.startImportedApp(app)
+                }
+                if selectedID == selected.id { notice = nil }
+            } catch is CancellationError {
+                return
+            } catch {
+                let name: String
+                switch target {
+                case .session: name = "沙箱"
+                case .terminal: name = "终端"
+                case .chrome: name = "Chrome"
+                case .imported(let app): name = app.name
+                }
+                errorMessage = "启动 \(name) 失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -462,25 +546,32 @@ final class DashboardModel: ObservableObject {
         activeSession?.startingAppIDs.contains(appID) == true
     }
 
-    func importApp(_ url: URL) {
-        guard var selected else { return }
+    func importApp(_ url: URL, for environmentID: UUID) {
+        guard let index = environments.firstIndex(where: { $0.id == environmentID }) else { return }
+        var environment = environments[index]
         let standardized = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard standardized.pathExtension.lowercased() == "app" else {
-            errorMessage = "请选择 .app 格式的 macOS 应用程序。"
+        guard standardized.pathExtension.lowercased() == "app",
+              let bundle = Bundle(url: standardized), let executable = bundle.executableURL,
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
+            errorMessage = "请选择包含有效可执行文件的 macOS .app。"
             return
         }
-        if selected.importedApps.contains(where: { $0.bundlePath == standardized.path }) {
+        if bundle.bundleIdentifier == "com.google.Chrome" {
+            notice = "可以直接使用首页的 Chrome 入口"
+            return
+        }
+        if environment.importedApps.contains(where: { $0.bundlePath == standardized.path }) {
             notice = "该应用已在当前环境列表中"
             return
         }
         let appName = standardized.deletingPathExtension().lastPathComponent
-        selected.importedApps.append(SandboxImportedApp(name: appName, bundlePath: standardized.path))
-        guard let index = environments.firstIndex(where: { $0.id == selected.id }) else { return }
+        environment.importedApps.append(SandboxImportedApp(name: appName, bundlePath: standardized.path))
         var updated = environments
-        updated[index] = selected
+        updated[index] = environment
         do {
             try store.save(updated)
             environments = updated
+            session(for: environment).runner.updateImportedApps(environment.importedApps)
             notice = "已导入应用「\(appName)」"
             objectWillChange.send()
         } catch {
@@ -489,37 +580,18 @@ final class DashboardModel: ObservableObject {
     }
 
     func removeImportedApp(_ app: SandboxImportedApp) {
-        guard var selected else { return }
-        stopImportedApp(app)
+        guard var selected, !isAppStarting(app.id) else { return }
         selected.importedApps.removeAll { $0.id == app.id }
         guard let index = environments.firstIndex(where: { $0.id == selected.id }) else { return }
         var updated = environments
         updated[index] = selected
         do {
             try store.save(updated)
+            stopImportedApp(app)
             environments = updated
-            objectWillChange.send()
+            session(for: selected).runner.updateImportedApps(selected.importedApps)
         } catch {
             errorMessage = "移除应用失败：\(error.localizedDescription)"
-        }
-    }
-
-    func startImportedApp(_ app: SandboxImportedApp) {
-        guard let selected else { return }
-        let current = session(for: selected)
-        guard current.isRunning, current.isProxyRunning,
-              !current.runningAppIDs.contains(app.id),
-              !current.startingAppIDs.contains(app.id) else { return }
-        current.startingAppIDs.insert(app.id)
-        objectWillChange.send()
-        Task {
-            do {
-                try await current.runner.startImportedApp(app)
-            } catch {
-                errorMessage = "启动 \(app.name) 失败：\(error.localizedDescription)"
-            }
-            current.startingAppIDs.remove(app.id)
-            objectWillChange.send()
         }
     }
 
@@ -546,7 +618,7 @@ final class DashboardModel: ObservableObject {
         }
         current.terminal.stop()
         current.runner.stop()
-        current.isRunning = false
+        current.launch = nil
         current.isProxyRunning = false
         current.isChromeRunning = false
         current.runningAppIDs.removeAll()
@@ -560,7 +632,7 @@ final class DashboardModel: ObservableObject {
         for current in sessions.values {
             current.terminal.stop()
             current.runner.stop()
-            current.isRunning = false
+            current.launch = nil
             current.isProxyRunning = false
             current.isChromeRunning = false
             current.runningAppIDs.removeAll()
@@ -575,10 +647,20 @@ struct MainView: View {
     @StateObject private var model = DashboardModel()
     @State private var showingAddEnvironment = false
     @State private var showingYAMLImporter = false
-    @State private var showingAppImporter = false
     @State private var showingSubscriptionImport = false
     @State private var showingRemoveConfirmation = false
+    @State private var showingCheckPopover = false
+    @State private var noProxyStart: NoProxyStart?
     @State private var showingNoProxyConfirmation = false
+
+    private struct NoProxyStart {
+        let environmentID: UUID
+        let target: SandboxLaunchTarget
+    }
+
+    private var launchBlocked: Bool {
+        model.isStarting || model.isProxyStarting || model.isImporting || model.isInspectingExit
+    }
     @State private var scrollToLatestRequest = 0
 
     var body: some View {
@@ -588,7 +670,20 @@ struct MainView: View {
             VStack(spacing: 0) {
                 topBar
                 Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
-                terminalPane
+                if model.hasTerminalTab {
+                    workspaceTabs
+                    Divider()
+                }
+                ZStack {
+                    applicationsPane
+                        .opacity(model.showsTerminal ? 0 : 1)
+                        .allowsHitTesting(!model.showsTerminal)
+                        .accessibilityHidden(model.showsTerminal)
+                    terminalPane
+                        .opacity(model.showsTerminal ? 1 : 0)
+                        .allowsHitTesting(model.showsTerminal)
+                        .accessibilityHidden(!model.showsTerminal)
+                }
             }
         }
         .background(Color(red: 0.055, green: 0.065, blue: 0.08))
@@ -597,13 +692,6 @@ struct MainView: View {
             if case .success(let urls) = result, let url = urls.first {
                 let accessed = url.startAccessingSecurityScopedResource()
                 model.importYAML(url)
-                if accessed { url.stopAccessingSecurityScopedResource() }
-            }
-        }
-        .fileImporter(isPresented: $showingAppImporter, allowedContentTypes: [.applicationBundle], allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let url = urls.first {
-                let accessed = url.startAccessingSecurityScopedResource()
-                model.importApp(url)
                 if accessed { url.stopAccessingSecurityScopedResource() }
             }
         }
@@ -630,21 +718,40 @@ struct MainView: View {
         }
         .confirmationDialog("当前未启用代理", isPresented: $showingNoProxyConfirmation, titleVisibility: .visible) {
             Button("仍要无代理启动（断网）", role: .destructive) {
-                model.start()
+                if let request = noProxyStart, request.environmentID == model.selectedID {
+                    model.start(request.target)
+                }
+                noProxyStart = nil
             }
-            Button("取消", role: .cancel) { }
+            Button("取消", role: .cancel) { noProxyStart = nil }
         } message: {
-            Text("当前环境尚未选择代理节点，代理不会启动。此时进入沙箱将处于断网状态，且无法打开隔离版 Chrome。确定要继续吗？")
+            Text("当前环境尚未选择代理节点。继续启动后，终端将处于断网状态。Chrome 和导入的应用需要代理节点才能启动。")
         }
         .onDisappear { model.stopAll() }
         .task { model.startDemoIfNeeded() }
     }
 
-    private func triggerStart() {
-        if model.selected?.node == nil {
+    private func triggerStart(_ target: SandboxLaunchTarget = .session) {
+        guard let environment = model.selected else { return }
+        if environment.node == nil && !model.isRunning {
+            noProxyStart = NoProxyStart(environmentID: environment.id, target: target)
             showingNoProxyConfirmation = true
         } else {
-            model.start()
+            model.start(target)
+        }
+    }
+
+    private func openApplicationPicker() {
+        guard let environmentID = model.selectedID else { return }
+        let panel = NSOpenPanel()
+        panel.title = "导入应用"
+        panel.prompt = "导入"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK, let url = panel.url {
+            model.importApp(url, for: environmentID)
         }
     }
 
@@ -686,23 +793,11 @@ struct MainView: View {
 
             Spacer(minLength: 8)
 
-            statusPill
-
-            Button {
-                model.isChromeRunning ? model.stopChrome() : model.startChrome()
-            } label: {
-                Label(
-                    model.isChromeStarting ? "启动 Chrome…" : (model.isChromeRunning ? "关闭 Chrome" : "打开 Chrome"),
-                    systemImage: "globe"
-                )
-                .font(.system(size: 11, weight: .semibold))
-                .padding(.horizontal, 9).padding(.vertical, 7)
+            if let report = model.checkReport {
+                checkReportBadge(report)
             }
-            .buttonStyle(.bordered)
-            .tint(model.isChromeRunning ? model.selected.map { Color(hex: $0.resolvedAccentHex) } : nil)
-            .disabled(model.isChromeStarting || (!model.isChromeRunning && (!model.isRunning || !model.isProxyRunning)))
-            .help("启动带代理节点的沙箱后即可打开隔离版 Chrome（带当前环境专属彩色外框）")
-            .accessibilityIdentifier("toggleChromeButton")
+
+            statusPill
 
             Button {
                 model.isRunning ? model.stop() : triggerStart()
@@ -716,7 +811,7 @@ struct MainView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(model.isRunning ? Color(red: 0.72, green: 0.25, blue: 0.25) : Color(red: 0.14, green: 0.50, blue: 0.78))
-            .disabled(model.selected == nil || model.isStarting || model.isImporting || model.isInspectingExit)
+            .disabled(model.selected == nil || launchBlocked)
             .accessibilityIdentifier("startSandboxButton")
         }
         .padding(.horizontal, 16)
@@ -741,7 +836,7 @@ struct MainView: View {
     }
 
     private var compactStatusText: String {
-        if model.isStarting { return "启动中…" }
+        if model.isStarting { return "启动与检测中…" }
         if !model.isRunning { return model.selected?.node == nil ? "未选节点" : "未启动" }
         if !model.isProxyRunning { return "已断网" }
         if let ip = model.exitIP {
@@ -750,68 +845,222 @@ struct MainView: View {
         return "代理就绪 · \(model.resolvedTimeZone)"
     }
 
+    private func checkReportBadge(_ report: ProxyCheckReport) -> some View {
+        let badgeColor: Color = report.allPassed ? .green : (report.hasFailure ? .red : .orange)
+        let iconName = report.allPassed ? "checkmark.shield.fill" : (report.hasFailure ? "exclamationmark.shield.fill" : "shield.lefthalf.filled")
+        let titleText = report.allPassed
+            ? "伪装全过 \(report.passedCount)/\(report.totalCount)"
+            : (report.hasFailure ? "检测异常 \(report.passedCount)/\(report.totalCount)" : "伪装 \(report.passedCount)/\(report.totalCount)")
+        return Button {
+            showingCheckPopover.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: iconName)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(titleText)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(badgeColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(badgeColor.opacity(0.14))
+            .overlay(Capsule().stroke(badgeColor.opacity(0.35), lineWidth: 1))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("点击查看完整代理与隐藏检测报告")
+        .popover(isPresented: $showingCheckPopover, arrowEdge: .bottom) {
+            ProxyCheckPopoverView(report: report)
+        }
+    }
+
+    private var workspaceTabs: some View {
+        HStack(spacing: 6) {
+            Button {
+                model.showApps()
+            } label: {
+                Label("应用", systemImage: "square.grid.2x2")
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(!model.showsTerminal ? Color.white.opacity(0.10) : .clear,
+                                in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("applicationsTab")
+
+            HStack(spacing: 8) {
+                Button {
+                    model.showTerminal()
+                } label: {
+                    Label("终端", systemImage: "terminal")
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("terminalTab")
+
+                Button {
+                    model.showApps(closingTerminalTab: true)
+                } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("关闭标签页，终端继续在后台运行")
+                .accessibilityLabel("关闭终端标签页")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(model.showsTerminal ? Color.white.opacity(0.10) : .clear,
+                        in: RoundedRectangle(cornerRadius: 6))
+            Spacer()
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(Color(red: 0.065, green: 0.075, blue: 0.095))
+    }
+
+    private var applicationsPane: some View {
+        Group {
+            if let environment = model.selected {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Text("应用").font(.system(size: 23, weight: .semibold))
+                            .accessibilityAddTraits(.isHeader)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 132, maximum: 164), spacing: 14)], alignment: .leading, spacing: 14) {
+                            appTile("终端", running: model.isTerminalRunning, identifier: "terminalAppButton") {
+                                model.showTerminal()
+                                if !model.isTerminalRunning && !launchBlocked { triggerStart(.terminal) }
+                            } icon: {
+                                Image(systemName: "terminal")
+                                    .font(.system(size: 27, weight: .medium))
+                                    .foregroundStyle(.cyan)
+                                    .frame(width: 48, height: 48)
+                            }
+
+                            appTile("Chrome", running: model.isChromeRunning, starting: model.isChromeStarting,
+                                    identifier: "toggleChromeButton") {
+                                model.start(.chrome)
+                            } icon: {
+                                bundleIcon(NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome")?.path,
+                                           fallback: "globe")
+                            }
+                            .disabled(model.isChromeStarting || (launchBlocked && !model.isChromeRunning))
+                            .contextMenu {
+                                if model.isChromeRunning {
+                                    Button("关闭 Chrome") { model.stopChrome() }
+                                }
+                            }
+
+                            ForEach(environment.importedApps) { app in
+                                let running = model.isAppRunning(app.id)
+                                let starting = model.isAppStarting(app.id)
+                                appTile(app.name, running: running, starting: starting, identifier: app.id.uuidString) {
+                                    model.start(.imported(app))
+                                } icon: {
+                                    bundleIcon(app.bundlePath)
+                                }
+                                .disabled(starting || (launchBlocked && !running))
+                                .contextMenu {
+                                    if running {
+                                        Button("关闭应用") { model.stopImportedApp(app) }
+                                    }
+                                    Button("从环境移除", role: .destructive) { model.removeImportedApp(app) }
+                                        .disabled(starting)
+                                }
+                            }
+
+                            appTile("导入应用", identifier: "importAppButton", action: openApplicationPicker) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 24, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 48, height: 48)
+                            }
+                        }
+                    }
+                    .padding(26)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                VStack(spacing: 12) {
+                    Text("还没有工作环境").font(.system(size: 15, weight: .semibold))
+                    Button {
+                        showingAddEnvironment = true
+                    } label: {
+                        Label("新建工作环境", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func appTile<Icon: View>(
+        _ title: String, running: Bool = false, starting: Bool = false, identifier: String,
+        action: @escaping () -> Void, @ViewBuilder icon: () -> Icon
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                icon()
+                    .accessibilityHidden(true)
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 102)
+            .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.07)))
+            .overlay(alignment: .topTrailing) {
+                if starting {
+                    ProgressView().controlSize(.small).padding(8)
+                } else if running {
+                    Circle().fill(Color.green).frame(width: 6, height: 6).padding(10)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityIdentifier(identifier)
+        .accessibilityValue(starting ? "启动中" : (running ? "运行中" : ""))
+    }
+
+    @ViewBuilder
+    private func bundleIcon(_ path: String?, fallback: String = "app") -> some View {
+        if let path, FileManager.default.fileExists(atPath: path) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: path))
+                .resizable().scaledToFit().frame(width: 48, height: 48)
+        } else {
+            Image(systemName: fallback).font(.system(size: 27)).frame(width: 48, height: 48)
+        }
+    }
+
     private var terminalPane: some View {
         VStack(spacing: 0) {
             NativeTerminalView(
-                environmentID: model.selectedID,
+                environmentID: model.showsTerminal ? model.selectedID : nil,
                 terminals: model.allTerminals,
                 validEnvironmentIDs: Set(model.environments.map(\.id)),
-                sessionActive: model.isRunning,
+                sessionActive: model.showsTerminal && model.isRunning && model.isTerminalRunning,
                 scrollToLatestRequest: scrollToLatestRequest
             ) { id, columns, rows in
                 model.updateTerminalSize(for: id, columns: columns, rows: rows)
             }
             .background(Color(red: 0.035, green: 0.04, blue: 0.05))
             .overlay {
-                if model.isStarting {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("正在启动沙箱会话").font(.system(size: 13, weight: .medium)).foregroundStyle(.white.opacity(0.88))
-                        Text(model.selected?.node == nil ? "初始化 macOS Seatbelt…" : "正在启动 mihomo 代理与 macOS Seatbelt…")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                    .padding(24)
-                    .background(Color(red: 0.06, green: 0.07, blue: 0.09).opacity(0.94))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else if !model.isRunning {
+                if model.showsTerminal && (!model.isRunning || !model.isTerminalRunning) {
                     VStack(spacing: 12) {
-                        Image(systemName: "terminal")
-                            .font(.system(size: 26))
-                            .foregroundStyle(Color.cyan.opacity(0.85))
-                        Text(model.selected == nil ? "还没有工作环境" : "沙箱会话未启动")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.88))
-                        Text(emptyStateSubtitle)
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: 320)
-                        if model.selected == nil {
-                            Button {
-                                showingAddEnvironment = true
-                            } label: {
-                                Label("新建工作环境", systemImage: "plus")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .padding(.horizontal, 14).padding(.vertical, 6)
-                            }
-                            .buttonStyle(.borderedProminent)
+                        if model.isStarting {
+                            ProgressView()
+                            Text("正在启动沙箱会话").font(.system(size: 13, weight: .medium))
                         } else {
-                            Button {
-                                triggerStart()
-                            } label: {
-                                Label("启动沙箱", systemImage: "play.fill")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .padding(.horizontal, 16).padding(.vertical, 6)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(Color(red: 0.14, green: 0.50, blue: 0.78))
-                            .disabled(model.isImporting || model.isInspectingExit)
+                            Image(systemName: "terminal").font(.system(size: 26)).foregroundStyle(.cyan)
+                            Button("启动终端") { triggerStart(.terminal) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(launchBlocked)
                         }
                     }
                     .padding(26)
-                    .background(Color(red: 0.06, green: 0.07, blue: 0.09).opacity(0.92))
-                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08), lineWidth: 1))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .background(Color(red: 0.06, green: 0.07, blue: 0.09), in: RoundedRectangle(cornerRadius: 12))
                 }
             }
 
@@ -821,7 +1070,7 @@ struct MainView: View {
                 Text(model.selected?.node.map { "节点：\($0)" } ?? "未选节点（断网）")
                     .lineLimit(1).truncationMode(.middle)
                 Spacer()
-                if model.isRunning {
+                if model.isRunning && model.isTerminalRunning {
                     Button("回到底部") { scrollToLatestRequest += 1 }
                         .buttonStyle(.plain)
                         .foregroundStyle(.white.opacity(0.65))
@@ -836,25 +1085,16 @@ struct MainView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var emptyStateSubtitle: String {
-        guard let selected = model.selected else {
-            return "在左侧添加一个项目目录，选择「本机直通」或「纯隔离」模式即可开始。"
-        }
-        if selected.node == nil {
-            return "建议先在左侧导入并选择一个代理节点，再启动沙箱和隔离版 Chrome。"
-        }
-        return "已选节点「\(selected.node ?? "")」，点击下方按钮将自动拉起 mihomo 代理与终端。"
-    }
-
     // MARK: - Left Sidebar
 
     private var sidebarPane: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: "shippingbox.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(Color(red: 0.4, green: 0.75, blue: 0.97))
-                Text("ccBox")
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 22, height: 22)
+                Text("ccbox")
                     .font(.system(size: 14, weight: .bold))
                 Spacer()
                 Button { showingAddEnvironment = true } label: {
@@ -880,7 +1120,6 @@ struct MainView: View {
 
                     if model.selected != nil {
                         proxyAndNetworkSection
-                        importedAppsSection
                         environmentFooterSection
                     }
 
@@ -1067,7 +1306,9 @@ struct MainView: View {
                     }
                 }
 
-                if let exit = model.inspectedExit {
+                if let report = model.checkReport {
+                    ProxyCheckSidebarCard(report: report)
+                } else if let exit = model.inspectedExit {
                     VStack(alignment: .leading, spacing: 3) {
                         if let ip = exit.ip {
                             Text("出口 IP：\(ip)").font(.system(size: 10, design: .monospaced))
@@ -1100,79 +1341,6 @@ struct MainView: View {
                 }
             }
             .padding(12)
-            .background(Color.white.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 9))
-        }
-    }
-
-    private var importedAppsSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("沙箱应用")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button { showingAppImporter = true } label: {
-                    Label("导入 APP", systemImage: "plus")
-                        .font(.system(size: 10, weight: .medium))
-                        .padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(Color.white.opacity(0.06))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(0.85))
-                .help("导入其他 macOS .app，在当前环境的代理、时区和彩色外框下隔离运行")
-            }
-            .padding(.horizontal, 4)
-
-            VStack(alignment: .leading, spacing: 6) {
-                let apps = model.selected?.importedApps ?? []
-                if apps.isEmpty {
-                    Text("可导入其他 macOS 应用（如 Cursor、Antigravity、Firefox 等），启动时自动走当前代理并套上同色外框。")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    ForEach(apps) { app in
-                        let running = model.isAppRunning(app.id)
-                        let starting = model.isAppStarting(app.id)
-                        HStack(spacing: 8) {
-                            Image(systemName: "app.dashed")
-                                .font(.system(size: 11))
-                                .foregroundStyle(running ? Color.green : Color.secondary)
-                            Text(app.name)
-                                .font(.system(size: 11, weight: .medium))
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            Button {
-                                running ? model.stopImportedApp(app) : model.startImportedApp(app)
-                            } label: {
-                                Text(starting ? "启动中…" : (running ? "停止" : "启动"))
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .padding(.horizontal, 8).padding(.vertical, 4)
-                                    .background(running ? Color.red.opacity(0.20) : Color.white.opacity(0.08))
-                                    .foregroundStyle(running ? Color.red : .white.opacity(0.9))
-                                    .clipShape(RoundedRectangle(cornerRadius: 5))
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(starting || (!running && (!model.isRunning || !model.isProxyRunning)))
-
-                            Button {
-                                model.removeImportedApp(app)
-                            } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("从环境移除此应用")
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-            }
-            .padding(11)
-            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.white.opacity(0.03))
             .clipShape(RoundedRectangle(cornerRadius: 9))
         }

@@ -1,26 +1,27 @@
-# ccBox
+# ccbox
 
-**专为 macOS 打造的超轻量 AI 开发隔离工作台：原生 macOS Seatbelt 内核禁直连、全局代理隔离、多环境并行与数篷 DACS 风格彩色外框。**
+**专为 macOS 打造的超轻量 AI 开发隔离工作台：原生 macOS Seatbelt 内核禁直连、全局代理隔离、启动前伪装自检、多环境并行与数篷 DACS 风格彩色外框。**
 
 [简体中文](./README.md) · [English](./README.en.md)
 
-## 为什么做 ccBox？
+## 为什么做 ccbox？
 
 在 macOS 上同时使用 **Claude Code**、**Codex**、**Antigravity (Agy)** 或其他 AI 开发工具时，传统虚拟机方案往往需要数十 GB 系统镜像、高内存占用和卡顿的远程桌面。
 
-**ccBox** 采用**原生轻量化路线**：零虚拟机镜像、毫秒级启动。直接利用 macOS 内置 **Seatbelt（`/usr/bin/sandbox-exec`）** 在内核层封死外网直连，让每个工作环境拥有独立的 **mihomo 全局代理出口、独立账号配置、自动对齐的时区与网页语言、独立的 `xterm.js` 终端**，以及带**专属颜色外部边框**的隔离版 Chrome 和自定义导入的 macOS 应用。
+**ccbox** 采用**原生轻量化路线**：零虚拟机镜像、毫秒级启动。直接利用 macOS 内置 **Seatbelt（`/usr/bin/sandbox-exec`）** 在内核层封死外网直连，让每个工作环境拥有独立的 **mihomo 全局代理出口、独立账号配置、自动对齐的时区与网页语言、独立的 `xterm.js` 终端**，以及带**专属颜色外部边框**的隔离版 Chrome 和自定义导入的 macOS 应用。
 
 ## 核心特性
 
 - **原生 macOS Seatbelt 内核级网络隔离**：不依赖虚拟机，也不依赖第三方 Node 沙箱封装，直接在内核层禁止非回环外网直连；所有出站流量强制经过当前环境所选的 mihomo 全局代理节点（默认关闭 IPv6），代理停止即自动断网并关闭关联应用。
+- **启动前代理伪装自检（对齐 `ip.net.coffee/claude`）**：每次启动代理/沙箱或点击「测出口」时自动执行 7 项检测（出口 IP/ASN/ISP 与 Claude 支持地区、IPv6 泄露防护、`claude.ai`/`api.anthropic.com` 连通与延迟、Seatbelt 直连拦截验证、DNS/QUIC/WebRTC 隐藏、时区与出口一致性、浏览器语言伪装），结果直观展示在顶栏徽章与侧边栏卡片中。
 - **双模式工作环境**：
   - **本机直通**：网络、Claude 登录态与浏览器严格隔离；同时直接读写原项目目录，无缝复用你本机的 Shell、Homebrew、nvm/Python/Git 工具链。
   - **纯隔离**：首次启动复制项目副本并在独立 HOME 中运行，完全隔离宿主用户目录与外部卷，交互式提示符与 `pwd` 呈现为 `/workspace` 和 `/home`。
 - **多环境同时运行，随时无缝切换**：每个环境拥有独立的 mihomo 端口、独立的 `xterm.js` 终端缓冲区与后台输出流；左侧列表随时切换，后台环境的终端与 Chrome/导入应用持续运行不被杀掉。
-- **隔离版 Chrome + 导入其他 macOS APP**：
+- **隔离版 Chrome + 导入其他 macOS APP（浏览器链接重定向）**：
   - 复制本机 Chrome 到沙箱目录并保留 Chrome 原生沙箱，独立用户数据目录、匹配节点时区 `TZ`，保持中文界面并将网页语言设为 `en-US,en`，同时禁用 QUIC、本地 DNS 解析与非代理 WebRTC UDP。
-  - 自动接管沙箱终端的 `$BROWSER` 与 `open` 网页打开请求，授权登录链接自动在当前环境的隔离版 Chrome 打开。
-  - 支持侧边栏 **「导入 APP」** 添加任意其他 `.app`（如 Cursor、Antigravity、Firefox 等），启动时自动走当前环境的代理、时区与独立数据目录（Electron/Chromium 应用自动附加强制代理参数）。
+  - 不仅终端与 CLI 工具会自动拉起当前环境的隔离 Chrome，导入的原生/Electron macOS 应用（如 Gemini）调用 `NSWorkspace` / `LSOpenCFURLRef` 打开 `http/https` 链接时，也会通过内置 URL Hook 自动重定向到**当前所属隔离环境的 Chrome**（优先当前环境导入的 Chrome，否则回退到该环境的隔离 Chrome），不串宿主也不串其他环境。
+  - 在应用首页点击 **「＋ 导入应用」** 为当前环境添加其他 macOS `.app`。启动副本时设置当前环境的代理、时区与独立数据目录，Electron/Chromium 应用另有代理启动参数。
 - **数篷 DACS 风格外部彩色边框**：新建环境自动分配专属高对比颜色，该环境启动的 Chrome 及导入的其他应用窗口外部都会套上一层透明、不拦截鼠标点击的 3.5pt 彩色圆角外框，一眼区分不同账号环境，且不篡改应用原生主题。
 - **成熟稳定的 `xterm.js` 终端**：采用与 VS Code 同款的 `xterm.js` + `FitAddon` + `Unicode11Addon`，完美适配现代 TUI、中文宽字符与窗口实时缩放。
 - **安全护栏**：未选代理节点时启动沙箱会弹出二次确认；退出应用（`Cmd+Q`）时自动清理所有并行运行的代理、终端、Chrome、导入应用与边框叠加层。
@@ -37,7 +38,7 @@
 
 ```sh
 ./scripts/build-app.sh
-open "dist/ccBox.app"
+open "dist/ccbox.app"
 ```
 
 > 如需自定义应用图标，将 `1024×1024` 的 PNG 覆盖到 `scripts/icon.png`，再重新运行 `./scripts/build-app.sh` 即可自动生成 `AppIcon.icns`。
@@ -46,7 +47,7 @@ open "dist/ccBox.app"
 
 1. **新建工作环境**：点击左上角 `+ 新建`，选择 **本机直通** 或 **纯隔离** 模式并选定项目目录（自动分配专属颜色）。
 2. **导入并选择代理节点**：点击「导入订阅」或「导入 YAML」（支持 Clash/mihomo YAML 与 Base64 订阅），选好节点后可点「测出口」核对出口 IP、城市和时区。
-3. **启动沙箱与浏览器/应用**：点击右上角「启动沙箱」进入终端；点击「打开 Chrome」或在左侧「沙箱应用」导入并启动其他 `.app`。
+3. **打开应用**：在首页点「终端」打开终端标签页，点 Chrome 或已导入的应用打开独立窗口。首次打开时启动对应的沙箱会话。点「＋ 导入应用」添加本机 `.app`。
 
 ## 架构与隔离边界
 

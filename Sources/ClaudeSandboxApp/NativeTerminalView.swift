@@ -223,6 +223,7 @@ struct NativeTerminalView: NSViewRepresentable {
         private func slot(for id: UUID) -> WebSlot {
             if let existing = slots[id] { return existing }
             let created = WebSlot(id: id, coordinator: self)
+            created.webView.isHidden = id != activeEnvironmentID
             slots[id] = created
             if let container {
                 container.addSubview(created.webView)

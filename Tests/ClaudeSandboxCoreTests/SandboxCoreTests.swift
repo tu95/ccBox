@@ -170,6 +170,10 @@ final class SandboxCoreTests: XCTestCase {
     @MainActor
     func testOfflineShellUsesSeatbeltWithoutProxy() async throws {
         guard FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") else { throw XCTSkip("sandbox-exec is unavailable") }
+        let probe = try? runTool("/usr/bin/sandbox-exec", arguments: ["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        guard probe?.status == 0 else {
+            throw XCTSkip("Nested sandbox-exec is blocked by outer sandbox environment")
+        }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let workspace = folder.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
@@ -187,11 +191,9 @@ final class SandboxCoreTests: XCTestCase {
         let launch = try await runner.start(environment)
         XCTAssertEqual(launch.workingDirectory, store.isolatedWorkspace(for: environment).path)
         XCTAssertNil(launch.endpoint)
-        let data = try Data(contentsOf: URL(fileURLWithPath: launch.arguments[1]))
-        let policy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let network = try XCTUnwrap(policy["network"] as? [String: Any])
-        XCTAssertEqual(network["allowedDomains"] as? [String], [])
-        XCTAssertNil(network["parentProxy"])
+        let profile = try String(contentsOfFile: launch.arguments[1], encoding: .utf8)
+        XCTAssertTrue(profile.contains("(deny network*)"))
+        XCTAssertFalse(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"))
 
         let terminal = SandboxTerminal()
         let exited = expectation(description: "Interactive shell exited")

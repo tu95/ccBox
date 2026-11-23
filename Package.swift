@@ -5,7 +5,8 @@ let package = Package(
     name: "ClaudeSandbox",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "ClaudeSandboxApp", targets: ["ClaudeSandboxApp"])
+        .executable(name: "ClaudeSandboxApp", targets: ["ClaudeSandboxApp"]),
+        .executable(name: "ccbox-verify", targets: ["ccbox-verify"])
     ],
     targets: [
         .target(name: "SandboxPTY"),
@@ -14,6 +15,10 @@ let package = Package(
             name: "ClaudeSandboxApp",
             dependencies: ["ClaudeSandboxCore"],
             resources: [.copy("Resources/xterm")]
+        ),
+        .executableTarget(
+            name: "ccbox-verify",
+            dependencies: ["ClaudeSandboxCore"]
         ),
         .testTarget(name: "ClaudeSandboxCoreTests", dependencies: ["ClaudeSandboxCore"])
     ]

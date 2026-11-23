@@ -9,6 +9,27 @@ public struct SandboxLaunch {
     public let endpoint: String?
     public let timeZoneIdentifier: String
     public let exitIP: String?
+    public let checkReport: ProxyCheckReport?
+
+    public init(
+        executable: String,
+        arguments: [String],
+        environment: [String],
+        workingDirectory: String,
+        endpoint: String?,
+        timeZoneIdentifier: String,
+        exitIP: String?,
+        checkReport: ProxyCheckReport? = nil
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+        self.workingDirectory = workingDirectory
+        self.endpoint = endpoint
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.exitIP = exitIP
+        self.checkReport = checkReport
+    }
 }
 
 public struct SandboxExit {
@@ -16,6 +37,21 @@ public struct SandboxExit {
     public let timeZoneIdentifier: String?
     public let country: String?
     public let city: String?
+    public let checkReport: ProxyCheckReport?
+
+    public init(
+        ip: String?,
+        timeZoneIdentifier: String?,
+        country: String?,
+        city: String?,
+        checkReport: ProxyCheckReport? = nil
+    ) {
+        self.ip = ip
+        self.timeZoneIdentifier = timeZoneIdentifier
+        self.country = country
+        self.city = city
+        self.checkReport = checkReport
+    }
 }
 
 @MainActor
@@ -35,10 +71,14 @@ public final class SandboxRunner {
     private var importedAppProcesses: [UUID: Process] = [:]
     private var importedAppCopying: Set<UUID> = []
     private var browserBridge: BrowserBridge?
+    private var browserOpenTask: Task<Void, Never>?
     private var runtime: URL?
     private var sessionID: UUID?
     private var activeEnvironmentID: UUID?
     private var activeEnvironmentFolder: URL?
+    private var activeWorkspace: URL?
+    private var activeSourceWorkspace: URL?
+    private var activeSandboxExec: String?
     private var activeProxyLaunch: ProxyLaunch?
     private var activeSandboxConfig: URL?
     private var activeBrowserProfile: URL?
@@ -48,8 +88,13 @@ public final class SandboxRunner {
     private var activeEnvironmentName: String?
     private var activeIsolationMode: SandboxIsolationMode = .isolated
     private var activeAccentHex: String = "#3B82F6"
-    private var chromeCopyInProgress = false
+    private var activeImportedApps: [SandboxImportedApp] = []
+    private var chromePreparation: Task<URL, Error>?
     private var ready = false
+
+    public func updateImportedApps(_ apps: [SandboxImportedApp]) {
+        activeImportedApps = apps
+    }
 
     public init(store: SandboxStore) {
         self.store = store
@@ -99,7 +144,7 @@ public final class SandboxRunner {
 
     public var isProxyRunning: Bool { proxy?.isRunning == true }
 
-    public func startProxyOnly(_ environment: SandboxEnvironment) async throws {
+    public func startProxyOnly(_ environment: SandboxEnvironment) async throws -> ProxyCheckReport {
         guard sessionID == nil, proxy == nil else { throw SandboxFailure("已有代理或会话正在运行。") }
         guard let node = try store.loadNodes(for: environment).first(where: { $0.name == environment.node }) else {
             throw SandboxFailure("请先导入 YAML 或订阅，并选择一个代理节点。")
@@ -114,13 +159,27 @@ public final class SandboxRunner {
             try await validateProxy(mihomo, environment: toolEnvironment, launch: launch, runtime: runDirectory)
             try ensureSession(token)
             let process = try startProxy(mihomo, environment: toolEnvironment, launch: launch, runtime: runDirectory)
-            try await Task.detached { try waitForLocalProxy(ports: [launch.httpPort, launch.socksPort]) }.value
+            let pinnedTimeZone = environment.timeZoneIdentifier
+            let report = try await Task.detached { () -> ProxyCheckReport in
+                try waitForLocalProxy(ports: [launch.httpPort, launch.socksPort])
+                let exitInfo = try? lookupDetailedExit(through: launch)
+                let tz = pinnedTimeZone ?? exitInfo?.timezone ?? TimeZone.current.identifier
+                return runProxyPreFlightChecks(
+                    proxyEndpoint: launch.endpoint,
+                    sandboxProfile: nil,
+                    sandboxExec: nil,
+                    sandboxEnv: nil,
+                    resolvedTimeZone: tz,
+                    exitInfo: exitInfo
+                )
+            }.value
             try ensureSession(token)
             guard process.isRunning else { throw SandboxFailure("mihomo 启动后退出了。") }
             activeEnvironmentID = environment.id
             activeProxyLaunch = launch
             ready = true
             sessionID = nil
+            return report
         } catch {
             if sessionID == token { stop() }
             throw error
@@ -148,8 +207,6 @@ public final class SandboxRunner {
             }
             throw SandboxFailure("Chrome 已在运行。")
         }
-        guard !chromeCopyInProgress else { throw SandboxFailure("Chrome 正在准备中，请稍候。") }
-
         let chromeBinary = try await ensureChromeBinary()
         try ensureSession(token)
         guard proxy?.isRunning == true else { throw SandboxFailure("代理已停止，请重新启动沙箱会话。") }
@@ -162,11 +219,7 @@ public final class SandboxRunner {
         }
         try makePrivateDirectory(browserProfile)
         try makePrivateDirectory(browserHome)
-        let environmentName = activeEnvironmentName ?? "Sandbox"
-        try applyChromeWebLanguage(
-            to: browserProfile,
-            environmentName: environmentName
-        )
+        try applyChromeWebLanguage(to: browserProfile, workspace: activeWorkspace)
         guard let runtime else { throw CancellationError() }
         let browserTemporary = runtime.appendingPathComponent("chrome", isDirectory: true)
         try makePrivateDirectory(browserTemporary)
@@ -175,7 +228,7 @@ public final class SandboxRunner {
             base: toolEnvironment, browserHome: browserHome, browserTemporary: browserTemporary,
             proxyLaunch: proxyLaunch, timeZone: activeTimeZone
         )
-        let arguments = chromeArguments(
+        let arguments = sandboxChromeArguments(
             browserProfile: browserProfile,
             proxyLaunch: proxyLaunch,
             initialURL: initialURL
@@ -207,19 +260,24 @@ public final class SandboxRunner {
         if FileManager.default.isExecutableFile(atPath: chromeBinary.path) {
             return chromeBinary
         }
+        if let chromePreparation { return try await chromePreparation.value }
         guard let source = ToolPaths.chromeBundle else {
             throw SandboxFailure("本机未找到 Google Chrome.app。请先安装 Chrome，再重试。")
         }
-        chromeCopyInProgress = true
-        defer { chromeCopyInProgress = false }
+        let preparation = Task.detached {
+            try Self.installChrome(from: source, bundle: chromeBundle, binary: chromeBinary)
+        }
+        chromePreparation = preparation
+        defer { chromePreparation = nil }
+        return try await preparation.value
+    }
+
+    private nonisolated static func installChrome(from source: URL, bundle chromeBundle: URL, binary chromeBinary: URL) throws -> URL {
         try makePrivateDirectory(chromeBundle.deletingLastPathComponent())
         let staging = chromeBundle.deletingLastPathComponent()
             .appendingPathComponent(".Google Chrome-\(UUID().uuidString).app", isDirectory: true)
-        let copied = await Task.detached {
-            let result = try? runTool("/usr/bin/ditto", arguments: [source.path, staging.path])
-            return result?.status == 0
-        }.value
-        guard copied else {
+        let result = try? runTool("/usr/bin/ditto", arguments: [source.path, staging.path])
+        guard result?.status == 0 else {
             try? FileManager.default.removeItem(at: staging)
             throw SandboxFailure("复制 Chrome 到沙箱存储目录失败。")
         }
@@ -244,7 +302,7 @@ public final class SandboxRunner {
         try makePrivateDirectory(browserTemporary)
         let process = Process()
         process.executableURL = chromeBinary
-        process.arguments = chromeArguments(browserProfile: browserProfile, proxyLaunch: proxyLaunch, initialURL: url)
+        process.arguments = sandboxChromeArguments(browserProfile: browserProfile, proxyLaunch: proxyLaunch, initialURL: url)
         process.currentDirectoryURL = runtime
         process.environment = chromeEnvironment(
             base: toolEnvironment, browserHome: browserHome, browserTemporary: browserTemporary,
@@ -256,10 +314,17 @@ public final class SandboxRunner {
         try process.run()
     }
 
-    private nonisolated func openURLFromTerminal(_ url: URL) {
-        Task { @MainActor [weak self] in
-            guard let self, self.ready, self.proxy?.isRunning == true else { return }
-            try? await self.startChrome(opening: url)
+    private func enqueueBrowserURL(_ url: URL, session token: UUID) {
+        guard ready, sessionID == token, proxy?.isRunning == true else { return }
+        let previousOpen = browserOpenTask
+        browserOpenTask = Task { [weak self] in
+            await previousOpen?.value
+            guard let self, self.sessionID == token, !Task.isCancelled else { return }
+            if let importedChrome = self.activeImportedApps.first(where: isChromeImportedApp) {
+                try? await self.startImportedApp(importedChrome, opening: url)
+            } else {
+                try? await self.startChrome(opening: url)
+            }
         }
     }
 
@@ -269,14 +334,18 @@ public final class SandboxRunner {
         terminate(current)
     }
 
-    public func startImportedApp(_ app: SandboxImportedApp) async throws {
+    public func startImportedApp(_ app: SandboxImportedApp, opening initialURL: URL? = nil) async throws {
         guard ready, let token = sessionID, proxy?.isRunning == true,
               let folder = activeEnvironmentFolder,
+              let workspace = activeWorkspace,
+              let sourceWorkspace = activeSourceWorkspace,
+              let sandboxExec = activeSandboxExec,
               let toolEnvironment = activeToolEnvironment,
               let proxyLaunch = activeProxyLaunch else {
             throw SandboxFailure("请先启动已选择代理节点的沙箱会话。")
         }
-        guard importedAppProcesses[app.id]?.isRunning != true else {
+        let alreadyRunning = importedAppProcesses[app.id]?.isRunning == true
+        if alreadyRunning && initialURL == nil {
             throw SandboxFailure("\(app.name) 已在运行。")
         }
         guard !importedAppCopying.contains(app.id) else {
@@ -298,6 +367,31 @@ public final class SandboxRunner {
             try makePrivateDirectory(dir)
         }
 
+        if prepared.isChrome {
+            try applyChromeWebLanguage(to: appProfile, workspace: workspace)
+        }
+
+        let hookDylib = prepared.isChrome ? nil : coboxURLHookDylibURL()
+        let shellStartup = runtime.appendingPathComponent("shell-startup", isDirectory: true)
+        let appSandboxProfile = appTemp.appendingPathComponent("app-sandbox.sb")
+        if !prepared.isChrome {
+            try writePrivate(
+                Data(importedAppSeatbeltProfile(
+                    workspace: workspace,
+                    source: sourceWorkspace,
+                    store: store,
+                    runtime: runtime,
+                    shellStartup: shellStartup,
+                    appBundle: prepared.bundleURL,
+                    appRoot: appRoot,
+                    appTemp: appTemp,
+                    hookDylib: hookDylib,
+                    isolationMode: activeIsolationMode
+                ).utf8),
+                to: appSandboxProfile
+            )
+        }
+
         var environment = chromeEnvironment(
             base: toolEnvironment,
             browserHome: appHome,
@@ -309,14 +403,67 @@ public final class SandboxRunner {
         environment["https_proxy"] = proxyLaunch.endpoint
         environment["all_proxy"] = "socks5h://127.0.0.1:\(proxyLaunch.socksPort)"
         environment["no_proxy"] = "localhost,127.0.0.1,::1"
+        environment["CCBOX_SANDBOX_WORKSPACE"] = workspace.path
+        if !prepared.isChrome {
+            environment["CCBOX_SPOOF_LOCALE"] = "1"
+            environment["LANG"] = "en_US.UTF-8"
+            environment["LC_ALL"] = "en_US.UTF-8"
+            environment["LC_CTYPE"] = "en_US.UTF-8"
+            if activeIsolationMode == .isolated {
+                environment["CCBOX_ALLOWED_PATHS"] = [workspace.path, appRoot.path, appTemp.path].joined(separator: ":")
+            }
+        }
+        if let browserBridge {
+            let browserBin = runtime.appendingPathComponent("shell-startup/bin/browser", isDirectory: true)
+            environment.merge(browserBridge.variables) { _, value in value }
+            environment["BROWSER"] = browserBin.appendingPathComponent("sandbox-browser").path
+            environment["PATH"] = browserBin.path + ":" + (toolEnvironment["PATH"] ?? "/usr/bin:/bin")
+        }
+        if let hookDylib {
+            if let existing = environment["DYLD_INSERT_LIBRARIES"], !existing.isEmpty {
+                environment["DYLD_INSERT_LIBRARIES"] = "\(hookDylib.path):\(existing)"
+            } else {
+                environment["DYLD_INSERT_LIBRARIES"] = hookDylib.path
+            }
+        }
 
-        let arguments: [String] = prepared.isChromiumBased
-            ? chromeArguments(browserProfile: appProfile, proxyLaunch: proxyLaunch)
-            : []
+        let appArguments: [String]
+        if prepared.isChrome {
+            appArguments = sandboxChromeArguments(browserProfile: appProfile, proxyLaunch: proxyLaunch, initialURL: initialURL)
+        } else if prepared.isChromiumBased {
+            appArguments = ["--no-sandbox"] + chromeArguments(browserProfile: appProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
+        } else {
+            appArguments = ["-AppleLanguages", "(en-US, en)", "-AppleLocale", "en_US"]
+        }
+
+        let launchExecutable: URL
+        let launchArguments: [String]
+        if prepared.isChrome {
+            launchExecutable = prepared.executableURL
+            launchArguments = appArguments
+        } else {
+            launchExecutable = URL(fileURLWithPath: sandboxExec)
+            launchArguments = ["-f", appSandboxProfile.path, prepared.executableURL.path] + appArguments
+        }
+
+        if importedAppProcesses[app.id]?.isRunning == true {
+            if initialURL != nil, prepared.isChromiumBased {
+                let opener = Process()
+                opener.executableURL = launchExecutable
+                opener.arguments = launchArguments
+                opener.currentDirectoryURL = runtime
+                opener.environment = environment
+                opener.standardInput = FileHandle.nullDevice
+                opener.standardOutput = FileHandle.nullDevice
+                opener.standardError = FileHandle.nullDevice
+                try opener.run()
+            }
+            return
+        }
 
         let process = Process()
-        process.executableURL = prepared.executableURL
-        process.arguments = arguments
+        process.executableURL = launchExecutable
+        process.arguments = launchArguments
         process.currentDirectoryURL = runtime
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
@@ -356,15 +503,26 @@ public final class SandboxRunner {
         try await validateProxy(mihomo, environment: toolEnvironment, launch: launch, runtime: runDirectory)
         try ensureSession(token)
         let process = try startProxy(mihomo, environment: toolEnvironment, launch: launch, runtime: runDirectory)
-        try await Task.detached { try waitForLocalProxy(ports: [launch.httpPort, launch.socksPort]) }.value
-        let location = try await Task.detached {
-            try lookupExit(through: launch)
+        let pinnedTimeZone = environment.timeZoneIdentifier
+        let (location, report) = try await Task.detached { () -> (DetailedExitInfo?, ProxyCheckReport) in
+            try waitForLocalProxy(ports: [launch.httpPort, launch.socksPort])
+            let info = try? lookupDetailedExit(through: launch)
+            let tz = pinnedTimeZone ?? info?.timezone ?? TimeZone.current.identifier
+            let report = runProxyPreFlightChecks(
+                proxyEndpoint: launch.endpoint,
+                sandboxProfile: nil,
+                sandboxExec: nil,
+                sandboxEnv: nil,
+                resolvedTimeZone: tz,
+                exitInfo: info
+            )
+            return (info, report)
         }.value
         try ensureSession(token)
         guard process.isRunning else { throw SandboxFailure("mihomo 已退出，无法检测出口。") }
         guard let location else { throw SandboxFailure("出口检测服务未返回有效结果。") }
         return SandboxExit(ip: location.ip, timeZoneIdentifier: location.timezone,
-                           country: location.country, city: location.city)
+                           country: location.country, city: location.city, checkReport: report)
     }
 
     public func stop() {
@@ -377,10 +535,15 @@ public final class SandboxRunner {
         importedAppProcesses.removeAll()
         proxy = nil
         browserBridge = nil
+        browserOpenTask?.cancel()
+        browserOpenTask = nil
         runtime = nil
         sessionID = nil
         activeEnvironmentID = nil
         activeEnvironmentFolder = nil
+        activeWorkspace = nil
+        activeSourceWorkspace = nil
+        activeSandboxExec = nil
         activeProxyLaunch = nil
         activeSandboxConfig = nil
         activeBrowserProfile = nil
@@ -389,6 +552,7 @@ public final class SandboxRunner {
         activeTimeZone = nil
         activeEnvironmentName = nil
         activeIsolationMode = .isolated
+        activeImportedApps = []
         ready = false
         currentBridge?.stop()
         if let currentBrowser { terminate(currentBrowser) }
@@ -427,13 +591,14 @@ public final class SandboxRunner {
         let temporary = runtime.appendingPathComponent("tmp", isDirectory: true)
         let shellStartup = runtime.appendingPathComponent("shell-startup", isDirectory: true)
         let shellBin = shellStartup.appendingPathComponent("bin", isDirectory: true)
-        for path in [store.root, folder, shellHome, configuration, temporary, browserProfile, browserHome, shellStartup, shellBin] {
+        let browserBin = shellBin.appendingPathComponent("browser", isDirectory: true)
+        for path in [store.root, folder, shellHome, configuration, temporary, browserProfile, browserHome, browserBin] {
             try makePrivateDirectory(path)
         }
         let rcContent = environment.isolationMode == .isolated ? Self.shellRC : Self.passthroughShellRC
         try writePrivate(Data(rcContent.utf8), to: shellStartup.appendingPathComponent(".zshrc"))
-        try writeExecutableScript(Self.browserShimScript, to: shellBin.appendingPathComponent("sandbox-browser"))
-        try writeExecutableScript(Self.openShimScript, to: shellBin.appendingPathComponent("open"))
+        try writeExecutableScript(Self.browserShimScript, to: browserBin.appendingPathComponent("sandbox-browser"))
+        try writeExecutableScript(Self.openShimScript, to: browserBin.appendingPathComponent("open"))
         try writeExecutableScript(Self.codexShimScript, to: shellBin.appendingPathComponent("codex"))
         if environment.isolationMode == .isolated {
             try writeExecutableScript(Self.mktempShimScript, to: shellBin.appendingPathComponent("mktemp"))
@@ -471,6 +636,9 @@ public final class SandboxRunner {
         let pinnedTimeZone = environment.timeZoneIdentifier
         activeEnvironmentID = environment.id
         activeEnvironmentFolder = folder
+        activeWorkspace = workspace
+        activeSourceWorkspace = source
+        activeSandboxExec = tools.sandboxExec
         activeSandboxConfig = sandboxProfile
         activeBrowserProfile = browserProfile
         activeBrowserHome = browserHome
@@ -478,19 +646,47 @@ public final class SandboxRunner {
         activeEnvironmentName = environment.name
         activeIsolationMode = environment.isolationMode
         activeAccentHex = environment.resolvedAccentHex
-        var location: ExitLocation?
+        activeImportedApps = environment.importedApps
+        var location: DetailedExitInfo?
+        var checkReport: ProxyCheckReport?
         if let proxyLaunch, let mihomo = tools.mihomo {
             if let reusableProxy {
                 guard proxy?.isRunning == true else { throw SandboxFailure("代理已停止，请重新启动代理。") }
-                location = pinnedTimeZone == nil ? (try? lookupExit(through: reusableProxy)) : nil
+                let checkResult = await Task.detached { () -> (DetailedExitInfo?, ProxyCheckReport) in
+                    let info = try? lookupDetailedExit(through: reusableProxy)
+                    let tz = pinnedTimeZone ?? info?.timezone ?? TimeZone.current.identifier
+                    let report = runProxyPreFlightChecks(
+                        proxyEndpoint: reusableProxy.endpoint,
+                        sandboxProfile: sandboxProfile,
+                        sandboxExec: tools.sandboxExec,
+                        sandboxEnv: checkEnvironment,
+                        resolvedTimeZone: tz,
+                        exitInfo: info
+                    )
+                    return (info, report)
+                }.value
+                location = checkResult.0
+                checkReport = checkResult.1
             } else {
                 try await validateProxy(mihomo, environment: tools.environment, launch: proxyLaunch, runtime: runtime)
                 try ensureSession(token)
                 let process = try startProxy(mihomo, environment: tools.environment, launch: proxyLaunch, runtime: runtime)
-                location = try await Task.detached {
+                let checkResult = try await Task.detached { () -> (DetailedExitInfo?, ProxyCheckReport) in
                     try waitForLocalProxy(ports: [proxyLaunch.httpPort, proxyLaunch.socksPort])
-                    return pinnedTimeZone == nil ? (try? lookupExit(through: proxyLaunch)) : nil
+                    let info = try? lookupDetailedExit(through: proxyLaunch)
+                    let tz = pinnedTimeZone ?? info?.timezone ?? TimeZone.current.identifier
+                    let report = runProxyPreFlightChecks(
+                        proxyEndpoint: proxyLaunch.endpoint,
+                        sandboxProfile: sandboxProfile,
+                        sandboxExec: tools.sandboxExec,
+                        sandboxEnv: checkEnvironment,
+                        resolvedTimeZone: tz,
+                        exitInfo: info
+                    )
+                    return (info, report)
                 }.value
+                location = checkResult.0
+                checkReport = checkResult.1
                 try ensureSession(token)
                 guard process.isRunning else { throw SandboxFailure("mihomo 已退出，无法启动沙箱会话。") }
             }
@@ -508,12 +704,13 @@ public final class SandboxRunner {
             launchEnvironment["CLAUDE_SANDBOX_SOCKS_PROXY"] = socksEndpoint
 
             let bridge = try BrowserBridge { [weak self] url in
-                self?.openURLFromTerminal(url)
+                Task { @MainActor [weak self] in
+                    self?.enqueueBrowserURL(url, session: token)
+                }
             }
             browserBridge?.stop()
             browserBridge = bridge
-            launchEnvironment["CLAUDE_SANDBOX_BROWSER_PORT"] = String(bridge.port)
-            launchEnvironment["CLAUDE_SANDBOX_BROWSER_TOKEN"] = bridge.token
+            launchEnvironment.merge(bridge.variables) { _, value in value }
         }
         let timeZone = pinnedTimeZone ?? location?.timezone ?? TimeZone.current.identifier
         activeTimeZone = timeZone
@@ -538,7 +735,8 @@ public final class SandboxRunner {
             workingDirectory: workspace.path,
             endpoint: proxyLaunch?.endpoint,
             timeZoneIdentifier: timeZone,
-            exitIP: location?.ip
+            exitIP: location?.ip,
+            checkReport: checkReport
         )
     }
 
@@ -547,8 +745,8 @@ public final class SandboxRunner {
         export HOME="$3" ZDOTDIR="$1" SHELL=/bin/zsh
         export TMPDIR="$2" TEMP="$2" TMP="$2"
         export CLAUDE_SANDBOX_BIN="$1/bin"
-        export PATH="$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
-        export BROWSER="$CLAUDE_SANDBOX_BIN/sandbox-browser"
+        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
+        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
         export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
         export no_proxy="$NO_PROXY"
         export CLAUDE_SANDBOX_WORKSPACE="$4"
@@ -560,8 +758,8 @@ public final class SandboxRunner {
     private static let passthroughShellBootstrap = """
         export ZDOTDIR="$1" SHELL=/bin/zsh
         export CLAUDE_SANDBOX_BIN="$1/bin"
-        export PATH="$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH"
-        export BROWSER="$CLAUDE_SANDBOX_BIN/sandbox-browser"
+        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH"
+        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
         export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
         export no_proxy="$NO_PROXY"
         export CLAUDE_SANDBOX_WORKSPACE="$2"
@@ -608,21 +806,27 @@ public final class SandboxRunner {
         url="$1"
         [ -n "$url" ] || exit 1
         if [ -z "$CLAUDE_SANDBOX_BROWSER_PORT" ] || [ -z "$CLAUDE_SANDBOX_BROWSER_TOKEN" ]; then
-          printf '沙箱未启用代理，无法打开隔离版 Chrome：%s\n' "$url" >&2
+          printf '沙箱未启用代理，无法打开隔离版 Chrome。\n' >&2
           exit 1
         fi
-        printf '%s %s\n' "$CLAUDE_SANDBOX_BROWSER_TOKEN" "$url" | /usr/bin/nc -w 2 127.0.0.1 "$CLAUDE_SANDBOX_BROWSER_PORT" >/dev/null 2>&1
+        reply=$(printf '%s %s\n' "$CLAUDE_SANDBOX_BROWSER_TOKEN" "$url" | /usr/bin/nc -w 2 127.0.0.1 "$CLAUDE_SANDBOX_BROWSER_PORT" 2>/dev/null)
+        [ "$reply" = OK ]
         """#
 
     private static let openShimScript = #"""
         #!/bin/sh
+        opened=0
+        status=0
         for arg in "$@"; do
           case "$arg" in
-            http://*|https://*)
-              exec "$(dirname "$0")/sandbox-browser" "$arg"
+            --args) break ;;
+            [hH][tT][tT][pP]://*|[hH][tT][tT][pP][sS]://*)
+              opened=1
+              "${0%/*}/sandbox-browser" "$arg" || status=1
               ;;
           esac
         done
+        [ "$opened" -eq 0 ] || exit "$status"
         exec /usr/bin/open "$@"
         """#
 
@@ -665,8 +869,8 @@ public final class SandboxRunner {
         export ZDOTDIR="$HOME"
         [[ ! -r "$HOME/.zshrc" ]] || source "$HOME/.zshrc"
         unalias codex 2>/dev/null || true
-        export PATH="$CLAUDE_SANDBOX_BIN:$PATH"
-        export BROWSER="$CLAUDE_SANDBOX_BIN/sandbox-browser"
+        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$PATH"
+        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
         if [[ -n "$CLAUDE_SANDBOX_HTTP_PROXY" ]]; then
           export HTTP_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY" HTTPS_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY"
           export http_proxy="$CLAUDE_SANDBOX_HTTP_PROXY" https_proxy="$CLAUDE_SANDBOX_HTTP_PROXY"
@@ -685,7 +889,7 @@ public final class SandboxRunner {
         typeset -gr _sandbox_tmp="${CLAUDE_SANDBOX_TMP:A}"
         [[ ! -r "$HOME/.zshrc" ]] || source "$HOME/.zshrc"
         unalias codex 2>/dev/null || true
-        export PATH="$CLAUDE_SANDBOX_BIN:$PATH"
+        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$PATH"
         export TMPDIR="$_sandbox_tmp" TEMP="$_sandbox_tmp" TMP="$_sandbox_tmp"
         if [[ -n "$CLAUDE_SANDBOX_HTTP_PROXY" ]]; then
           export HTTP_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY" HTTPS_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY"
@@ -737,8 +941,8 @@ public final class SandboxRunner {
             Task { @MainActor [weak self] in
                 defer { try? FileManager.default.removeItem(at: runtime) }
                 guard let self, self.proxy === finished, self.ready else { return }
-                self.stop()
                 self.onProxyExit?()
+                self.stop()
             }
         }
         try process.run()
@@ -905,7 +1109,7 @@ func chromeArguments(browserProfile: URL, proxyPort: UInt16, initialURL: URL? = 
     return arguments
 }
 
-func applyChromeWebLanguage(to browserProfile: URL, acceptLanguages: String = "en-US,en") throws {
+func applyChromeWebLanguage(to browserProfile: URL, acceptLanguages: String = "en-US,en", workspace: URL? = nil) throws {
     let defaultProfile = browserProfile.appendingPathComponent("Default", isDirectory: true)
     try makePrivateDirectory(defaultProfile)
     let preferencesURL = defaultProfile.appendingPathComponent("Preferences")
@@ -918,12 +1122,21 @@ func applyChromeWebLanguage(to browserProfile: URL, acceptLanguages: String = "e
     intl["accept_languages"] = acceptLanguages
     intl["selected_languages"] = acceptLanguages
     preferences["intl"] = intl
+    if let workspace {
+        var download = (preferences["download"] as? [String: Any]) ?? [:]
+        download["default_directory"] = workspace.path
+        preferences["download"] = download
+        var selectfile = (preferences["selectfile"] as? [String: Any]) ?? [:]
+        selectfile["last_directory"] = workspace.path
+        preferences["selectfile"] = selectfile
+    }
     let updated = try JSONSerialization.data(withJSONObject: preferences, options: [.sortedKeys])
     try writePrivate(updated, to: preferencesURL)
 }
 
-private func chromeArguments(browserProfile: URL, proxyLaunch: ProxyLaunch, initialURL: URL? = nil) -> [String] {
-    chromeArguments(browserProfile: browserProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
+private func sandboxChromeArguments(browserProfile: URL, proxyLaunch: ProxyLaunch, initialURL: URL? = nil) -> [String] {
+    // The isolated Chrome profile uses Chromium's mock keychain to avoid macOS keychain dialogs.
+    ["--use-mock-keychain"] + chromeArguments(browserProfile: browserProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
 }
 
 private func chromeEnvironment(
@@ -951,6 +1164,13 @@ private func writeExecutableScript(_ script: String, to url: URL) throws {
 final class BrowserBridge: @unchecked Sendable {
     let port: UInt16
     let token: String
+    var variables: [String: String] {
+        [
+            "CLAUDE_SANDBOX_BROWSER_PORT": String(port),
+            "CLAUDE_SANDBOX_BROWSER_TOKEN": token
+        ]
+    }
+
     private let listenFD: Int32
     private let queue = DispatchQueue(label: "ClaudeSandbox.browser.bridge", qos: .userInitiated)
     private let lock = NSLock()
@@ -1025,6 +1245,18 @@ final class BrowserBridge: @unchecked Sendable {
         }
     }
 
+    static func parseRequest(_ line: String, expectedToken: String) -> URL? {
+        let firstLine = line.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let parts = firstLine.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, String(parts[0]) == expectedToken,
+              let url = URL(string: String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.host != nil else {
+            return nil
+        }
+        return url
+    }
+
     private func handleClient(_ clientFD: Int32, onOpenURL: @escaping @Sendable (URL) -> Void) {
         defer { Darwin.close(clientFD) }
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
@@ -1041,12 +1273,7 @@ final class BrowserBridge: @unchecked Sendable {
             }
         }
         let line = String(decoding: received, as: UTF8.self)
-            .split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2, String(parts[0]) == token,
-              let url = URL(string: String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
-              url.host != nil else {
+        guard let url = Self.parseRequest(line, expectedToken: token) else {
             _ = "ERR\n".withCString { Darwin.write(clientFD, $0, 4) }
             return
         }
@@ -1140,10 +1367,10 @@ private func waitForLocalProxy(port: UInt16) throws {
     throw SandboxFailure("mihomo 未能启动本地代理。")
 }
 
-private func lookupExit(through proxy: ProxyLaunch) throws -> ExitLocation? {
+private func lookupDetailedExit(through proxy: ProxyLaunch) throws -> DetailedExitInfo? {
     for url in ["https://ipwho.is/", "https://ipapi.co/json/"] {
         let response = try proxyRequest(["--fail", url], through: proxy)
-        if response.status == 0, let location = ExitLocation(response.output) { return location }
+        if response.status == 0, let location = DetailedExitInfo(response.output) { return location }
     }
     return nil
 }
