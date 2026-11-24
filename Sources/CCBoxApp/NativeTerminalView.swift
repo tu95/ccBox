@@ -63,6 +63,8 @@ struct NativeTerminalView: NSViewRepresentable {
             let indexURL: URL?
             var ready = false
             var pendingOutput: [Data] = []
+            private var frameOutput = Data()
+            private var frameFlushScheduled = false
             weak var coordinator: Coordinator?
 
             init(id: UUID, coordinator: Coordinator) {
@@ -127,8 +129,17 @@ struct NativeTerminalView: NSViewRepresentable {
                     pendingOutput.append(data)
                     return
                 }
-                let encoded = data.base64EncodedString()
-                webView.evaluateJavaScript("window.termWrite && window.termWrite('\(encoded)');", completionHandler: nil)
+                frameOutput.append(data)
+                guard !frameFlushScheduled else { return }
+                frameFlushScheduled = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.frameFlushScheduled = false
+                    guard self.ready, !self.frameOutput.isEmpty else { return }
+                    let encoded = self.frameOutput.base64EncodedString()
+                    self.frameOutput.removeAll(keepingCapacity: true)
+                    self.webView.evaluateJavaScript("window.termWrite && window.termWrite('\(encoded)');", completionHandler: nil)
+                }
             }
 
             func flushPending() {

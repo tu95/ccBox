@@ -44,6 +44,7 @@
 <body>
   <div id="terminal"></div>
   <script src="./xterm.min.js"></script>
+  <script src="./addon-webgl.min.js"></script>
   <script src="./addon-fit.min.js"></script>
   <script src="./addon-unicode11.min.js"></script>
   <script>
@@ -104,6 +105,22 @@
       }
 
       term.open(container);
+
+      const input = container.querySelector('textarea');
+      if (input) {
+        input.setAttribute('autocorrect', 'off');
+        input.setAttribute('autocapitalize', 'off');
+        input.setAttribute('autocomplete', 'off');
+        input.setAttribute('spellcheck', 'false');
+      }
+
+      if (window.WebglAddon && window.WebglAddon.WebglAddon) {
+        try {
+          const webglAddon = new window.WebglAddon.WebglAddon();
+          term.loadAddon(webglAddon);
+          webglAddon.onContextLoss(() => webglAddon.dispose());
+        } catch (_) {}
+      }
 
       const post = (name, payload) => {
         try {
