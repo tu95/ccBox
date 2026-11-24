@@ -22,7 +22,7 @@ public enum SandboxSelfTest {
             ("3. SandboxTerminal 真实 PTY 与 TZ/PWD 注入", testTerminalLivePTY),
             ("4. 终端 Seatbelt 网络与文件系统规则", testTerminalSeatbelt),
             ("5. 导入应用 Seatbelt 纯隔离（禁直连 + 禁宿主机硬盘）", testImportedAppSeatbeltIsolated),
-            ("6. 导入应用 Seatbelt 直通模式（禁直连 + 禁宿主凭证）", testImportedAppSeatbeltPassthrough),
+            ("6. 共享临时目录与回环访问边界", testSharedTemporaryIsolation),
             ("7. Seatbelt 内核级真机阻断实测（非嵌套环境）", testSeatbeltLiveExecutionIfPermitted),
             ("8. Chrome 防泄露参数与 Preferences 工作区锁定", testChromeAntiLeakAndPreferences),
             ("9. 导入应用完整复制、原包删除后独立运行与识别", testImportedAppBundleDetection),
@@ -135,10 +135,10 @@ public enum SandboxSelfTest {
         let color2 = SandboxEnvironment.nextAccentHex(avoiding: [color1])
         try expect(color1 != color2, "多环境自动分配颜色重复")
 
-        var env1 = SandboxEnvironment(name: "env1", workspace: ws1, isolationMode: .isolated, accentHex: color1)
+        var env1 = SandboxEnvironment(name: "env1", workspace: ws1, accentHex: color1)
         env1.timeZoneIdentifier = "America/Los_Angeles"
         env1.importedApps.append(SandboxImportedApp(name: "Sample", bundlePath: "/Applications/Sample.app"))
-        let env2 = SandboxEnvironment(name: "env2", workspace: ws2, isolationMode: .hostPassthrough, accentHex: color2)
+        let env2 = SandboxEnvironment(name: "env2", workspace: ws2, accentHex: color2)
         try store.save([env1, env2])
         let loaded = try store.load()
         try expect(loaded == [env1, env2], "环境持久化读写不一致")
@@ -244,7 +244,7 @@ public enum SandboxSelfTest {
         let store = SandboxStore(root: base.appendingPathComponent("store", isDirectory: true))
         let ws = base.appendingPathComponent("isolated-ws", isDirectory: true)
         let src = base.appendingPathComponent("host-source", isDirectory: true)
-        let cfg = base.appendingPathComponent("claude-config", isDirectory: true)
+        let cfg = base.appendingPathComponent("app-config", isDirectory: true)
         let tmp = base.appendingPathComponent("tmp", isDirectory: true)
         let rt = base.appendingPathComponent("runtime", isDirectory: true)
         let sh = base.appendingPathComponent("shell-home", isDirectory: true)
@@ -257,26 +257,42 @@ public enum SandboxSelfTest {
             workspace: ws, source: src, store: store, configuration: cfg,
             temporary: tmp, runtime: rt, cliTools: [], shellHome: sh,
             shellStartup: ss, chromeBundle: cb, chromeProfile: cp, chromeHome: ch,
-            hasProxy: true, isolationMode: .isolated
+            allowedLoopbackPorts: [18080, 18081]
         )
         try expect(withProxy.contains("(deny network*)"), "缺少内核禁网规则")
-        try expect(withProxy.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "缺少回环代理放行规则")
+        try expect(withProxy.contains("(remote ip \"localhost:18080\")"), "缺少 HTTP 代理端口放行")
+        try expect(withProxy.contains("(remote ip \"localhost:18081\")"), "缺少 SOCKS 代理端口放行")
+        try expect(!withProxy.contains("remote ip \"localhost:*\""), "不应整体放行回环端口")
         try expect(withProxy.contains("(subpath \"/Users\")"), "未禁止访问 /Users")
         try expect(withProxy.contains("(subpath \"/Volumes\")"), "未禁止访问 /Volumes")
+        try expect(withProxy.contains("(subpath \"/Applications\")"), "未禁止访问宿主应用目录")
+        try expect(withProxy.contains("(subpath \"/private/tmp\")"), "未隔离共享临时目录")
+        try expect(withProxy.contains("(subpath \"/private/var/folders\")"), "未隔离用户级共享缓存目录")
         try expect(canonicalSeatbeltPath("/var/folders/ccbox-test-nonexistent") == "/private/var/folders/ccbox-test-nonexistent", "未将 /var 规范化为 /private/var")
         try expect(canonicalSeatbeltPath("/tmp/ccbox-test-nonexistent") == "/private/tmp/ccbox-test-nonexistent", "未将 /tmp 规范化为 /private/tmp")
         try expect(withProxy.contains(canonicalSeatbeltPath(src.path)), "未隔离原项目目录")
         try expect(withProxy.contains(canonicalSeatbeltPath(ws.path)), "未放行隔离工作区")
+        try expect(withProxy.contains(canonicalSeatbeltPath(tmp.path)), "未放行独立临时目录")
 
         let noProxy = seatbeltProfile(
             workspace: ws, source: src, store: store, configuration: cfg,
             temporary: tmp, runtime: rt, cliTools: [], shellHome: sh,
             shellStartup: ss, chromeBundle: cb, chromeProfile: cp, chromeHome: ch,
-            hasProxy: false, isolationMode: .isolated
+            allowedLoopbackPorts: []
         )
         try expect(noProxy.contains("(deny network*)"), "断网模式缺少禁网规则")
-        try expect(!noProxy.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "断网模式不应放行回环出口")
-        return "有代理与断网模式 Seatbelt 规则校验通过"
+        try expect(!noProxy.contains("allow network-outbound (remote ip"), "断网模式不应放行任何 IP 出站")
+
+        try makePrivateDirectory(rt)
+        let profileURL = rt.appendingPathComponent("terminal.sb")
+        try withProxy.write(to: profileURL, atomically: true, encoding: .utf8)
+        let check = try runTool(
+            "/usr/bin/sandbox-exec", arguments: ["-f", profileURL.path, "/usr/bin/true"],
+            captureOutput: true, captureError: true
+        )
+        let error = String(decoding: check.errorOutput, as: UTF8.self)
+        try expect(check.status == 0, "终端 Seatbelt 规则初始化失败：\(error)")
+        return "有代理与断网模式 Seatbelt 规则及真实初始化校验通过"
     }
 
     private static func testImportedAppSeatbeltIsolated() throws -> String {
@@ -297,10 +313,11 @@ public enum SandboxSelfTest {
         let profile = importedAppSeatbeltProfile(
             workspace: ws, source: src, store: store, runtime: rt,
             shellStartup: ss, appBundle: appBundle, appRoot: appRoot,
-            appTemp: appTemp, hookDylib: hook, isolationMode: .isolated
+            appTemp: appTemp, hookDylib: hook, allowedLoopbackPorts: [18080]
         )
         try expect(profile.contains("(deny network*)"), "导入应用缺少内核禁直连")
-        try expect(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"), "导入应用缺少本地代理放行")
+        try expect(profile.contains("(remote ip \"localhost:18080\")"), "导入应用缺少指定代理端口放行")
+        try expect(!profile.contains("remote ip \"localhost:*\""), "导入应用不应整体放行回环端口")
         try expect(profile.contains("(deny file-read* file-write*"), "导入应用缺少宿主机磁盘禁止规则")
         try expect(profile.contains("(subpath \"/Users\")"), "导入应用未封锁 /Users")
         try expect(profile.contains("(subpath \"/Volumes\")"), "导入应用未封锁 /Volumes")
@@ -310,7 +327,7 @@ public enum SandboxSelfTest {
         return "已封锁直连及 /Users、/Volumes、原目录，仅放行隔离区"
     }
 
-    private static func testImportedAppSeatbeltPassthrough() throws -> String {
+    private static func testSharedTemporaryIsolation() throws -> String {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -321,21 +338,20 @@ public enum SandboxSelfTest {
         let ss = base.appendingPathComponent("shell-startup", isDirectory: true)
         let appBundle = base.appendingPathComponent("Sample.app", isDirectory: true)
         let appRoot = base.appendingPathComponent("app-root", isDirectory: true)
-        let appTemp = base.appendingPathComponent("app-tmp", isDirectory: true)
+        let appTemp = rt.appendingPathComponent("app-temp", isDirectory: true)
 
         let profile = importedAppSeatbeltProfile(
             workspace: ws, source: ws, store: store, runtime: rt,
             shellStartup: ss, appBundle: appBundle, appRoot: appRoot,
-            appTemp: appTemp, hookDylib: nil, isolationMode: .hostPassthrough
+            appTemp: appTemp, hookDylib: nil, allowedLoopbackPorts: [18080]
         )
-        try expect(profile.contains("(deny network*)"), "直通模式导入应用缺少禁直连")
-        try expect(profile.contains("Library/Cookies"), "直通模式未隔离宿主 Cookies")
-        try expect(profile.contains("Library/HTTPStorages"), "直通模式未隔离宿主 HTTPStorages")
-        try expect(profile.contains("Library/WebKit"), "直通模式未隔离宿主 WebKit 缓存")
-        try expect(profile.contains("Library/Keychains"), "直通模式未隔离宿主 Keychains")
-        try expect(profile.contains("Library/Group Containers"), "直通模式未隔离宿主 Group Containers")
-        try expect(profile.contains(".claude"), "直通模式未隔离宿主 .claude")
-        return "直通模式已封锁直连及宿主 Cookies/HTTPStorages/WebKit/Keychains/Group Containers/.claude"
+        for path in ["/private/tmp", "/private/var/tmp", "/private/var/folders"] {
+            try expect(profile.contains("(subpath \"\(path)\")"), "未隔离共享路径 \(path)")
+        }
+        try expect(profile.contains(canonicalSeatbeltPath(appTemp.path)), "未放行环境专属临时目录")
+        try expect(profile.contains("local ip \"localhost:*\""), "监听地址未限制在回环接口")
+        try expect(!profile.contains("local ip \"*:*\""), "不应允许监听非回环接口")
+        return "共享临时目录已隔离，仅放行环境临时目录、指定代理端口与回环监听"
     }
 
     // MARK: - 7. Live Seatbelt Kernel Enforcement
@@ -368,7 +384,7 @@ public enum SandboxSelfTest {
         let sb = importedAppSeatbeltProfile(
             workspace: ws, source: src, store: store, runtime: rt,
             shellStartup: ss, appBundle: appBundle, appRoot: appRoot,
-            appTemp: appTemp, hookDylib: nil, isolationMode: .isolated
+            appTemp: appTemp, hookDylib: nil, allowedLoopbackPorts: [18080]
         )
         let sbURL = rt.appendingPathComponent("live-app.sb")
         try sb.write(to: sbURL, atomically: true, encoding: .utf8)
@@ -379,7 +395,18 @@ public enum SandboxSelfTest {
         let readDenied = try runTool("/usr/bin/sandbox-exec", arguments: ["-f", sbURL.path, "/bin/cat", srcFile.path], captureOutput: true)
         try expect(readDenied.status != 0, "安全漏洞：导入应用读到了隔离区外原目录文件！")
 
-        return "Seatbelt 内核真机实测通过：隔离区可读、区外文件内核级阻断"
+        let tempFile = appTemp.appendingPathComponent("temp.txt")
+        try "temp".write(to: tempFile, atomically: true, encoding: .utf8)
+        let readTemp = try runTool("/usr/bin/sandbox-exec", arguments: ["-f", sbURL.path, "/bin/cat", tempFile.path], captureOutput: true)
+        try expect(readTemp.status == 0, "环境专属临时目录不可读")
+
+        let sharedFile = URL(fileURLWithPath: "/private/tmp/ccbox-isolation-\(UUID().uuidString)")
+        try "outside".write(to: sharedFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: sharedFile) }
+        let readShared = try runTool("/usr/bin/sandbox-exec", arguments: ["-f", sbURL.path, "/bin/cat", sharedFile.path], captureOutput: true)
+        try expect(readShared.status != 0, "安全漏洞：导入应用读到了共享临时目录！")
+
+        return "Seatbelt 内核真机实测通过：隔离区与专属临时目录可读，原目录和共享临时目录被阻断"
     }
 
     // MARK: - 8. Chrome Flags & Preferences
@@ -499,8 +526,8 @@ public enum SandboxSelfTest {
             "com.apple.security.device.camera": true,
             "com.apple.security.automation.apple-events": true,
             "aps-environment": "production",
-            "keychain-access-groups": ["EQHXZ8M8AV.com.google.GeminiMacOS"],
-            "com.apple.security.application-groups": ["group.com.google.gemini"],
+            "keychain-access-groups": ["EQHXZ8M8AV.com.google.ExampleMacOS"],
+            "com.apple.security.application-groups": ["group.com.google.example"],
             "com.apple.developer.team-identifier": "EQHXZ8M8AV",
             "com.apple.security.app-sandbox": true,
             "com.apple.private.tcc.allow": ["kTCCServiceMicrophone"],

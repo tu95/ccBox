@@ -91,8 +91,8 @@ int main(void) {
         assert([scProxy[(NSString *)kCFNetworkProxiesSOCKSPort] intValue] == 28081);
 
         // 3. App Group container redirection & traversal rejection
-        NSURL *grp = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.google.gemini"];
-        assert(grp != nil && [grp.path containsString:@"/Library/Group Containers/group.com.google.gemini"]);
+        NSURL *grp = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.google.example"];
+        assert(grp != nil && [grp.path containsString:@"/Library/Group Containers/group.com.google.example"]);
         BOOL isDir = NO;
         assert([[NSFileManager defaultManager] fileExistsAtPath:grp.path isDirectory:&isDir] && isDir);
 
@@ -108,12 +108,12 @@ int main(void) {
         [std setObject:@"isolated_std" forKey:@"ccbox_probe_std"];
         assert([[std stringForKey:@"ccbox_probe_std"] isEqualToString:@"isolated_std"]);
 
-        NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:@"com.google.GeminiMacOS.shareddata"];
+        NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:@"com.google.ExampleMacOS.shareddata"];
         [suite setObject:@"isolated_suite" forKey:@"ccbox_probe_suite"];
         assert([[suite stringForKey:@"ccbox_probe_suite"] isEqualToString:@"isolated_suite"]);
 
-        CFPreferencesSetAppValue(CFSTR("ccbox_cf_key"), CFSTR("isolated_cf"), CFSTR("com.google.GeminiMacOS"));
-        CFStringRef cfVal = (CFStringRef)CFPreferencesCopyAppValue(CFSTR("ccbox_cf_key"), CFSTR("com.google.GeminiMacOS"));
+        CFPreferencesSetAppValue(CFSTR("ccbox_cf_key"), CFSTR("isolated_cf"), CFSTR("com.google.ExampleMacOS"));
+        CFStringRef cfVal = (CFStringRef)CFPreferencesCopyAppValue(CFSTR("ccbox_cf_key"), CFSTR("com.google.ExampleMacOS"));
         assert(cfVal != NULL && CFEqual(cfVal, CFSTR("isolated_cf")));
         if (cfVal) CFRelease(cfVal);
 

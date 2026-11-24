@@ -5,7 +5,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>ccbox</string>
 	<key>CFBundleExecutable</key>
-	<string>ClaudeSandboxApp</string>
+	<string>CCBoxApp</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>

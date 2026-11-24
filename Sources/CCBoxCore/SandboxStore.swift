@@ -1,24 +1,5 @@
 import Foundation
 
-public enum SandboxIsolationMode: String, Codable, CaseIterable, Sendable {
-    case isolated
-    case hostPassthrough
-
-    public var displayName: String {
-        switch self {
-        case .isolated: return "纯隔离"
-        case .hostPassthrough: return "本机直通"
-        }
-    }
-
-    public var summary: String {
-        switch self {
-        case .isolated: return "复制项目副本、独立 HOME 与文件强隔离"
-        case .hostPassthrough: return "网络与 Claude 账号强隔离，直接读写原目录并复用本机 Shell/工具"
-        }
-    }
-}
-
 public struct SandboxImportedApp: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public var name: String
@@ -50,21 +31,21 @@ public struct SandboxEnvironment: Codable, Identifiable, Equatable {
     public var workspace: URL
     public var node: String?
     public var timeZoneIdentifier: String?
-    public var isolationMode: SandboxIsolationMode
     public var accentHex: String?
     public var importedApps: [SandboxImportedApp]
+
+    public var displayName: String { "纯隔离" }
+    public var summary: String { "独立项目副本、HOME、临时目录、应用数据与代理出口" }
 
     public init(
         name: String,
         workspace: URL,
-        isolationMode: SandboxIsolationMode = .isolated,
         accentHex: String? = nil,
         importedApps: [SandboxImportedApp] = []
     ) {
         self.id = UUID()
         self.name = name
         self.workspace = workspace
-        self.isolationMode = isolationMode
         self.accentHex = accentHex
         self.importedApps = importedApps
     }
@@ -84,7 +65,7 @@ public struct SandboxEnvironment: Codable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, workspace, node, timeZoneIdentifier, isolationMode, accentHex, importedApps
+        case id, name, workspace, node, timeZoneIdentifier, accentHex, importedApps
     }
 
     public init(from decoder: Decoder) throws {
@@ -94,7 +75,6 @@ public struct SandboxEnvironment: Codable, Identifiable, Equatable {
         workspace = try container.decode(URL.self, forKey: .workspace)
         node = try container.decodeIfPresent(String.self, forKey: .node)
         timeZoneIdentifier = try container.decodeIfPresent(String.self, forKey: .timeZoneIdentifier)
-        isolationMode = try container.decodeIfPresent(SandboxIsolationMode.self, forKey: .isolationMode) ?? .isolated
         accentHex = try container.decodeIfPresent(String.self, forKey: .accentHex)
         importedApps = try container.decodeIfPresent([SandboxImportedApp].self, forKey: .importedApps) ?? []
     }
@@ -112,7 +92,7 @@ public struct SandboxStore: Sendable {
 
     public init(root: URL? = nil) {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        self.root = (root ?? support.appendingPathComponent("ClaudeSandbox", isDirectory: true))
+        self.root = (root ?? support.appendingPathComponent("CCBox", isDirectory: true))
             .standardizedFileURL.resolvingSymlinksInPath()
     }
 
@@ -160,12 +140,33 @@ public struct SandboxStore: Sendable {
         try writePrivate(JSONEncoder().encode(environments), to: indexURL)
     }
 
+    func additionalTemporaryDirectoryVariables() throws -> [String] {
+        let url = root.appendingPathComponent("temporary-directory-variables.json")
+        guard files.fileExists(atPath: url.path) else { return [] }
+        do {
+            let variables = try JSONDecoder().decode([String].self, from: Data(contentsOf: url))
+            let valid = variables.allSatisfy { variable in
+                variable.hasSuffix("_TMPDIR") && variable.unicodeScalars.allSatisfy {
+                    CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_").contains($0)
+                }
+            }
+            guard valid else {
+                throw SandboxFailure("临时目录变量配置只能包含大写字母、数字、下划线，并以 _TMPDIR 结尾。")
+            }
+            return Array(Set(variables)).sorted()
+        } catch let error as SandboxFailure {
+            throw error
+        } catch {
+            throw SandboxFailure("无法读取 temporary-directory-variables.json，请使用 JSON 字符串数组。")
+        }
+    }
+
     public func importApp(at url: URL, for environment: SandboxEnvironment) throws -> SandboxImportedApp {
         try importAppBundle(at: url, environmentID: environment.id, storeRoot: root)
     }
 
     public func removeImportedAppCopy(_ app: SandboxImportedApp, for environment: SandboxEnvironment) {
-        ClaudeSandboxCore.removeImportedAppCopy(app, environmentID: environment.id, storeRoot: root)
+        CCBoxCore.removeImportedAppCopy(app, environmentID: environment.id, storeRoot: root)
     }
 
     public func nodes(for environment: SandboxEnvironment) throws -> [String] {
@@ -200,7 +201,7 @@ public struct SandboxStore: Sendable {
 
     private func readNodes(at url: URL) throws -> [[String: Any]] {
         let appBundle = Bundle.main.resourceURL?
-            .appendingPathComponent("ClaudeSandbox_ClaudeSandboxCore.bundle", isDirectory: true)
+            .appendingPathComponent("CCBox_CCBoxCore.bundle", isDirectory: true)
         let resources = appBundle.flatMap(Bundle.init(url:)) ?? Bundle.module
         guard let parser = resources.url(forResource: "ImportNodes", withExtension: "rb") else {
             throw SandboxFailure("找不到 YAML 解析器。")
@@ -389,22 +390,25 @@ func writePrivate(_ data: Data, to url: URL) throws {
 struct ToolResult {
     let status: Int32
     let output: Data
+    let errorOutput: Data
 }
 
 func runTool(
     _ executable: String, arguments: [String], environment: [String: String]? = nil,
-    captureOutput: Bool = false
+    captureOutput: Bool = false, captureError: Bool = false
 ) throws -> ToolResult {
     let process = Process()
     let pipe = captureOutput ? Pipe() : nil
+    let errorPipe = captureError ? Pipe() : nil
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
     process.environment = environment
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = pipe as Any? ?? FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
+    process.standardError = errorPipe as Any? ?? FileHandle.nullDevice
     try process.run()
     let output = pipe?.fileHandleForReading.readDataToEndOfFile() ?? Data()
+    let errorOutput = errorPipe?.fileHandleForReading.readDataToEndOfFile() ?? Data()
     process.waitUntilExit()
-    return ToolResult(status: process.terminationStatus, output: output)
+    return ToolResult(status: process.terminationStatus, output: output, errorOutput: errorOutput)
 }

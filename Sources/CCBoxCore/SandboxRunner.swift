@@ -88,7 +88,6 @@ public final class SandboxRunner {
     private var activeToolEnvironment: [String: String]?
     private var activeTimeZone: String?
     private var activeEnvironmentName: String?
-    private var activeIsolationMode: SandboxIsolationMode = .isolated
     private var activeAccentHex: String = "#3B82F6"
     private var activeImportedApps: [SandboxImportedApp] = []
     private var chromePreparation: Task<URL, Error>?
@@ -145,15 +144,8 @@ public final class SandboxRunner {
         do {
             let store = self.store
             let environmentID = environment.id
-            let isolationMode = environment.isolationMode
             let workspace = try await Task.detached {
-                switch isolationMode {
-                case .isolated:
-                    return try store.prepareWorkspace(for: environmentID, source: source)
-                case .hostPassthrough:
-                    try validateWorkspace(source, store: store)
-                    return source
-                }
+                try store.prepareWorkspace(for: environmentID, source: source)
             }.value
             try ensureSession(token)
             let tools = try ToolPaths.discover(workspace: workspace, needsProxy: node != nil)
@@ -224,6 +216,7 @@ public final class SandboxRunner {
               let browserProfile = activeBrowserProfile,
               let browserHome = activeBrowserHome,
               let toolEnvironment = activeToolEnvironment,
+              let sandboxExec = activeSandboxExec,
               let proxyLaunch = activeProxyLaunch else {
             throw SandboxFailure("请先启动已选择代理节点的沙箱会话。")
         }
@@ -262,9 +255,13 @@ public final class SandboxRunner {
             initialURL: initialURL
         )
 
+        let sandboxProfile = try makeChromeSandboxProfile(
+            browserTemporary: browserTemporary, browserProfile: browserProfile,
+            browserHome: browserHome, proxyLaunch: proxyLaunch
+        )
         let process = Process()
-        process.executableURL = chromeBinary
-        process.arguments = arguments
+        process.executableURL = URL(fileURLWithPath: sandboxExec)
+        process.arguments = ["-f", sandboxProfile.path, chromeBinary.path] + arguments
         process.currentDirectoryURL = runtime
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
@@ -280,6 +277,29 @@ public final class SandboxRunner {
         try process.run()
         browser = process
         onBrowserStart?(process.processIdentifier)
+    }
+
+    private func makeChromeSandboxProfile(
+        browserTemporary: URL, browserProfile: URL, browserHome: URL, proxyLaunch: ProxyLaunch
+    ) throws -> URL {
+        guard let runtime, let workspace = activeWorkspace, let source = activeSourceWorkspace else {
+            throw SandboxFailure("隔离会话尚未准备完成。")
+        }
+        let shellStartup = runtime.appendingPathComponent("shell-startup", isDirectory: true)
+        let chromeBundle = store.root.appendingPathComponent("Runtime/Google Chrome.app", isDirectory: true)
+        var allowedLoopbackPorts: Set<Int> = [Int(proxyLaunch.httpPort), Int(proxyLaunch.socksPort)]
+        if let browserBridge { allowedLoopbackPorts.insert(Int(browserBridge.port)) }
+        let profile = browserTemporary.appendingPathComponent("chrome-sandbox.sb")
+        try writePrivate(
+            Data(seatbeltProfile(
+                workspace: workspace, source: source, store: store, configuration: browserProfile,
+                temporary: browserTemporary, runtime: runtime, cliTools: [], shellHome: browserHome,
+                shellStartup: shellStartup, chromeBundle: chromeBundle, chromeProfile: browserProfile,
+                chromeHome: browserHome, allowedLoopbackPorts: allowedLoopbackPorts
+            ).utf8),
+            to: profile
+        )
+        return profile
     }
 
     private func ensureChromeBinary() async throws -> URL {
@@ -328,9 +348,15 @@ public final class SandboxRunner {
         guard FileManager.default.isExecutableFile(atPath: chromeBinary.path) else { return }
         let browserTemporary = runtime.appendingPathComponent("chrome", isDirectory: true)
         try makePrivateDirectory(browserTemporary)
+        guard let sandboxExec = activeSandboxExec else { throw SandboxFailure("隔离会话尚未准备完成。") }
+        let sandboxProfile = try makeChromeSandboxProfile(
+            browserTemporary: browserTemporary, browserProfile: browserProfile,
+            browserHome: browserHome, proxyLaunch: proxyLaunch
+        )
         let process = Process()
-        process.executableURL = chromeBinary
-        process.arguments = sandboxChromeArguments(browserProfile: browserProfile, proxyLaunch: proxyLaunch, initialURL: url)
+        process.executableURL = URL(fileURLWithPath: sandboxExec)
+        process.arguments = ["-f", sandboxProfile.path, chromeBinary.path]
+            + sandboxChromeArguments(browserProfile: browserProfile, proxyLaunch: proxyLaunch, initialURL: url)
         process.currentDirectoryURL = runtime
         process.environment = chromeEnvironment(
             base: toolEnvironment, browserHome: browserHome, browserTemporary: browserTemporary,
@@ -403,23 +429,23 @@ public final class SandboxRunner {
         let hookDylib = prepared.isChrome ? nil : coboxURLHookDylibURL()
         let shellStartup = runtime.appendingPathComponent("shell-startup", isDirectory: true)
         let appSandboxProfile = appTemp.appendingPathComponent("app-sandbox.sb")
-        if !prepared.isChrome {
-            try writePrivate(
-                Data(importedAppSeatbeltProfile(
-                    workspace: workspace,
-                    source: sourceWorkspace,
-                    store: store,
-                    runtime: runtime,
-                    shellStartup: shellStartup,
-                    appBundle: prepared.bundleURL,
-                    appRoot: appRoot,
-                    appTemp: appTemp,
-                    hookDylib: hookDylib,
-                    isolationMode: activeIsolationMode
-                ).utf8),
-                to: appSandboxProfile
-            )
-        }
+        var allowedLoopbackPorts: Set<Int> = [Int(proxyLaunch.httpPort), Int(proxyLaunch.socksPort)]
+        if let browserBridge { allowedLoopbackPorts.insert(Int(browserBridge.port)) }
+        try writePrivate(
+            Data(importedAppSeatbeltProfile(
+                workspace: workspace,
+                source: sourceWorkspace,
+                store: store,
+                runtime: runtime,
+                shellStartup: shellStartup,
+                appBundle: prepared.bundleURL,
+                appRoot: appRoot,
+                appTemp: appTemp,
+                hookDylib: hookDylib,
+                allowedLoopbackPorts: allowedLoopbackPorts
+            ).utf8),
+            to: appSandboxProfile
+        )
 
         if !prepared.isChrome {
             await Task.detached { _ = ensureIsolatedLoginKeychain(at: appHome) }.value
@@ -450,9 +476,7 @@ public final class SandboxRunner {
             environment["LANG"] = "en_US.UTF-8"
             environment["LC_ALL"] = "en_US.UTF-8"
             environment["LC_CTYPE"] = "en_US.UTF-8"
-            if activeIsolationMode == .isolated {
-                environment["CCBOX_ALLOWED_PATHS"] = [workspace.path, appRoot.path, appTemp.path].joined(separator: ":")
-            }
+            environment["CCBOX_ALLOWED_PATHS"] = [workspace.path, appRoot.path, appTemp.path].joined(separator: ":")
         }
         if let browserBridge {
             let browserBin = runtime.appendingPathComponent("shell-startup/bin/browser", isDirectory: true)
@@ -477,15 +501,8 @@ public final class SandboxRunner {
             appArguments = ["-AppleLanguages", "(en-US, en)", "-AppleLocale", "en_US"]
         }
 
-        let launchExecutable: URL
-        let launchArguments: [String]
-        if prepared.isChrome {
-            launchExecutable = prepared.executableURL
-            launchArguments = appArguments
-        } else {
-            launchExecutable = URL(fileURLWithPath: sandboxExec)
-            launchArguments = ["-f", appSandboxProfile.path, prepared.executableURL.path] + appArguments
-        }
+        let launchExecutable = URL(fileURLWithPath: sandboxExec)
+        let launchArguments = ["-f", appSandboxProfile.path, prepared.executableURL.path] + appArguments
 
         if importedAppProcesses[app.id]?.isRunning == true {
             if initialURL != nil, prepared.isChromiumBased {
@@ -592,7 +609,6 @@ public final class SandboxRunner {
         activeToolEnvironment = nil
         activeTimeZone = nil
         activeEnvironmentName = nil
-        activeIsolationMode = .isolated
         activeImportedApps = []
         ready = false
         currentBridge?.stop()
@@ -620,7 +636,7 @@ public final class SandboxRunner {
     ) async throws -> SandboxLaunch {
         let folder = store.directory(for: environment)
         let shellHome = folder.appendingPathComponent("home", isDirectory: true)
-        let configuration = folder.appendingPathComponent("claude-config", isDirectory: true)
+        let configuration = folder.appendingPathComponent("app-config", isDirectory: true)
         let browserProfile = folder.appendingPathComponent("chrome-profile", isDirectory: true)
         let browserHome = folder.appendingPathComponent("chrome-home", isDirectory: true)
         let chromeBundle = store.root.appendingPathComponent("Runtime/Google Chrome.app", isDirectory: true)
@@ -637,41 +653,58 @@ public final class SandboxRunner {
         for path in [store.root, folder, shellHome, configuration, temporary, browserProfile, browserHome, browserBin] {
             try makePrivateDirectory(path)
         }
-        let rcContent = environment.isolationMode == .isolated ? Self.shellRC : Self.passthroughShellRC
-        try writePrivate(Data(rcContent.utf8), to: shellStartup.appendingPathComponent(".zshrc"))
+        try writePrivate(Data(Self.shellRC.utf8), to: shellStartup.appendingPathComponent(".zshrc"))
         try writeExecutableScript(Self.browserShimScript, to: browserBin.appendingPathComponent("sandbox-browser"))
         try writeExecutableScript(Self.openShimScript, to: browserBin.appendingPathComponent("open"))
-        try writeExecutableScript(Self.codexShimScript, to: shellBin.appendingPathComponent("codex"))
-        if environment.isolationMode == .isolated {
-            try writeExecutableScript(Self.mktempShimScript, to: shellBin.appendingPathComponent("mktemp"))
-        }
+        try writeExecutableScript(Self.mktempShimScript, to: shellBin.appendingPathComponent("mktemp"))
 
         let proxyLaunch = try node.map { node in
             if let reusableProxy { return reusableProxy }
             return try makeProxyLaunch(node: node, runtime: runtime)
         }
+        let bridge = try proxyLaunch.map { _ in
+            try BrowserBridge { [weak self] url in
+                Task { @MainActor [weak self] in
+                    self?.enqueueBrowserURL(url, session: token)
+                }
+            }
+        }
+        browserBridge?.stop()
+        browserBridge = bridge
+        var allowedLoopbackPorts = Set<Int>()
+        if let proxyLaunch {
+            allowedLoopbackPorts = [Int(proxyLaunch.httpPort), Int(proxyLaunch.socksPort)]
+        }
+        if let bridge { allowedLoopbackPorts.insert(Int(bridge.port)) }
         let sandboxProfile = runtime.appendingPathComponent("sandbox.sb")
         try writePrivate(
             Data(seatbeltProfile(
                 workspace: workspace, source: source, store: store, configuration: configuration,
                 temporary: temporary, runtime: runtime, cliTools: tools.cliTools, shellHome: shellHome, shellStartup: shellStartup,
                 chromeBundle: chromeBundle, chromeProfile: browserProfile, chromeHome: browserHome,
-                hasProxy: proxyLaunch != nil, isolationMode: environment.isolationMode
+                allowedLoopbackPorts: allowedLoopbackPorts
             ).utf8),
             to: sandboxProfile
         )
 
         var launchEnvironment = tools.environment
-        launchEnvironment["CLAUDE_CONFIG_DIR"] = configuration.path
         launchEnvironment["TMPDIR"] = temporary.path
+        launchEnvironment["XDG_RUNTIME_DIR"] = temporary.path
+        launchEnvironment["BUN_TMPDIR"] = temporary.path
+        for variable in try store.additionalTemporaryDirectoryVariables() {
+            launchEnvironment[variable] = temporary.path
+        }
         let sandboxArguments = ["-f", sandboxProfile.path]
         let checkEnvironment = launchEnvironment
         try await Task.detached {
             let check = try runTool(
-                tools.sandboxExec, arguments: sandboxArguments + ["/usr/bin/true"], environment: checkEnvironment
+                tools.sandboxExec, arguments: sandboxArguments + ["/usr/bin/true"],
+                environment: checkEnvironment, captureOutput: true, captureError: true
             )
             guard check.status == 0 else {
-                throw SandboxFailure("Seatbelt 初始化失败。请从 macOS Finder 启动应用，或在普通终端运行。")
+                let detail = String(decoding: check.errorOutput + check.output, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                throw SandboxFailure("Seatbelt 初始化失败。\(detail.isEmpty ? "请从 macOS Finder 启动应用，或在普通终端运行。" : detail)")
             }
         }.value
         try ensureSession(token)
@@ -686,7 +719,6 @@ public final class SandboxRunner {
         activeBrowserHome = browserHome
         activeToolEnvironment = tools.environment
         activeEnvironmentName = environment.name
-        activeIsolationMode = environment.isolationMode
         activeAccentHex = environment.resolvedAccentHex
         activeImportedApps = environment.importedApps
         var location: DetailedExitInfo?
@@ -742,34 +774,20 @@ public final class SandboxRunner {
             launchEnvironment["all_proxy"] = socksEndpoint
             launchEnvironment["NO_PROXY"] = "localhost,127.0.0.1,::1"
             launchEnvironment["no_proxy"] = "localhost,127.0.0.1,::1"
-            launchEnvironment["CLAUDE_SANDBOX_HTTP_PROXY"] = proxyLaunch.endpoint
-            launchEnvironment["CLAUDE_SANDBOX_SOCKS_PROXY"] = socksEndpoint
+            launchEnvironment["CCBOX_HTTP_PROXY"] = proxyLaunch.endpoint
+            launchEnvironment["CCBOX_SOCKS_PROXY"] = socksEndpoint
 
-            let bridge = try BrowserBridge { [weak self] url in
-                Task { @MainActor [weak self] in
-                    self?.enqueueBrowserURL(url, session: token)
-                }
+            if let bridge {
+                launchEnvironment.merge(bridge.variables) { _, value in value }
             }
-            browserBridge?.stop()
-            browserBridge = bridge
-            launchEnvironment.merge(bridge.variables) { _, value in value }
         }
         let timeZone = pinnedTimeZone ?? location?.timezone ?? TimeZone.current.identifier
         activeTimeZone = timeZone
         launchEnvironment["TZ"] = timeZone
-        let shellArgs: [String]
-        switch environment.isolationMode {
-        case .isolated:
-            shellArgs = [
-                "/bin/sh", "-c", Self.shellBootstrap, "sandbox-shell",
-                shellStartup.path, temporary.path, shellHome.path, workspace.path
-            ]
-        case .hostPassthrough:
-            shellArgs = [
-                "/bin/sh", "-c", Self.passthroughShellBootstrap, "sandbox-shell",
-                shellStartup.path, workspace.path
-            ]
-        }
+        let shellArgs = [
+            "/bin/sh", "-c", Self.shellBootstrap, "sandbox-shell",
+            shellStartup.path, temporary.path, shellHome.path, workspace.path
+        ]
         return SandboxLaunch(
             executable: tools.sandboxExec,
             arguments: sandboxArguments + shellArgs,
@@ -786,72 +804,26 @@ public final class SandboxRunner {
     private static let shellBootstrap = """
         export HOME="$3" ZDOTDIR="$1" SHELL=/bin/zsh
         export TMPDIR="$2" TEMP="$2" TMP="$2"
-        export CLAUDE_SANDBOX_BIN="$1/bin"
-        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
-        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
+        export CCBOX_BIN="$1/bin"
+        export PATH="$CCBOX_BIN/browser:$CCBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
+        export BROWSER="$CCBOX_BIN/browser/sandbox-browser"
         export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
         export no_proxy="$NO_PROXY"
-        export CLAUDE_SANDBOX_WORKSPACE="$4"
-        export CLAUDE_SANDBOX_TMP="$2"
-        cd "$CLAUDE_SANDBOX_WORKSPACE" || exit 1
+        export CCBOX_WORKSPACE="$4"
+        export CCBOX_TMP="$2"
+        cd "$CCBOX_WORKSPACE" || exit 1
         exec /bin/zsh -d -i
         """
-
-    private static let passthroughShellBootstrap = """
-        export ZDOTDIR="$1" SHELL=/bin/zsh
-        export CLAUDE_SANDBOX_BIN="$1/bin"
-        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$HOME/.local/bin:$HOME/bin:$PATH"
-        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
-        export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1"
-        export no_proxy="$NO_PROXY"
-        export CLAUDE_SANDBOX_WORKSPACE="$2"
-        cd "$CLAUDE_SANDBOX_WORKSPACE" || exit 1
-        exec /bin/zsh -i
-        """
-
-    private static let codexShimScript = #"""
-        #!/bin/sh
-        self="$(cd "$(dirname "$0")" && pwd)/codex"
-        real_codex=""
-        OLD_IFS="$IFS"
-        IFS=":"
-        for dir in $PATH; do
-          [ -n "$dir" ] || continue
-          cand="$dir/codex"
-          if [ -x "$cand" ] && [ "$cand" != "$self" ]; then
-            real_codex="$cand"
-            break
-          fi
-        done
-        IFS="$OLD_IFS"
-        if [ -z "$real_codex" ]; then
-          printf 'codex: command not found\n' >&2
-          exit 127
-        fi
-        pass_through=0
-        for arg in "$@"; do
-          case "$arg" in
-            --no-daemon|-h|--help|-V|--version|completion|help)
-              pass_through=1
-              break
-              ;;
-          esac
-        done
-        if [ "$pass_through" -eq 1 ]; then
-          exec "$real_codex" "$@"
-        fi
-        exec "$real_codex" --no-daemon "$@"
-        """#
 
     private static let browserShimScript = #"""
         #!/bin/sh
         url="$1"
         [ -n "$url" ] || exit 1
-        if [ -z "$CLAUDE_SANDBOX_BROWSER_PORT" ] || [ -z "$CLAUDE_SANDBOX_BROWSER_TOKEN" ]; then
+        if [ -z "$CCBOX_BROWSER_PORT" ] || [ -z "$CCBOX_BROWSER_TOKEN" ]; then
           printf '沙箱未启用代理，无法打开隔离版 Chrome。\n' >&2
           exit 1
         fi
-        reply=$(printf '%s %s\n' "$CLAUDE_SANDBOX_BROWSER_TOKEN" "$url" | /usr/bin/nc -w 2 127.0.0.1 "$CLAUDE_SANDBOX_BROWSER_PORT" 2>/dev/null)
+        reply=$(printf '%s %s\n' "$CCBOX_BROWSER_TOKEN" "$url" | /usr/bin/nc -w 2 127.0.0.1 "$CCBOX_BROWSER_PORT" 2>/dev/null)
         [ "$reply" = OK ]
         """#
 
@@ -874,7 +846,7 @@ public final class SandboxRunner {
 
     private static let mktempShimScript = #"""
         #!/bin/sh
-        dir="${CLAUDE_SANDBOX_TMP:-${TMPDIR:-/tmp}}"
+        dir="${CCBOX_TMP:-${TMPDIR:-/tmp}}"
         dir="${dir%/}"
         flags=""
         prefix="tmp"
@@ -907,41 +879,37 @@ public final class SandboxRunner {
         exec /usr/bin/mktemp $flags "$dir/${prefix}.XXXXXXXXXX"
         """#
 
-    private static let passthroughShellRC = #"""
-        export ZDOTDIR="$HOME"
-        [[ ! -r "$HOME/.zshrc" ]] || source "$HOME/.zshrc"
-        unalias codex 2>/dev/null || true
-        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$PATH"
-        export BROWSER="$CLAUDE_SANDBOX_BIN/browser/sandbox-browser"
-        if [[ -n "$CLAUDE_SANDBOX_HTTP_PROXY" ]]; then
-          export HTTP_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY" HTTPS_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY"
-          export http_proxy="$CLAUDE_SANDBOX_HTTP_PROXY" https_proxy="$CLAUDE_SANDBOX_HTTP_PROXY"
-          export ALL_PROXY="$CLAUDE_SANDBOX_SOCKS_PROXY" all_proxy="$CLAUDE_SANDBOX_SOCKS_PROXY"
-        else
-          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-        fi
-        export NO_PROXY="localhost,127.0.0.1,::1"
-        export no_proxy="$NO_PROXY"
-        """#
-
     private static let shellRC = #"""
         export ZDOTDIR="$HOME"
-        typeset -gr _sandbox_workspace="${CLAUDE_SANDBOX_WORKSPACE:A}"
+        typeset -gr _sandbox_workspace="${CCBOX_WORKSPACE:A}"
         typeset -gr _sandbox_home="${HOME:A}"
-        typeset -gr _sandbox_tmp="${CLAUDE_SANDBOX_TMP:A}"
+        typeset -gr _sandbox_tmp="${CCBOX_TMP:A}"
         [[ ! -r "$HOME/.zshrc" ]] || source "$HOME/.zshrc"
-        unalias codex 2>/dev/null || true
-        export PATH="$CLAUDE_SANDBOX_BIN/browser:$CLAUDE_SANDBOX_BIN:$PATH"
+        export PATH="$CCBOX_BIN/browser:$CCBOX_BIN:$PATH"
         export TMPDIR="$_sandbox_tmp" TEMP="$_sandbox_tmp" TMP="$_sandbox_tmp"
-        if [[ -n "$CLAUDE_SANDBOX_HTTP_PROXY" ]]; then
-          export HTTP_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY" HTTPS_PROXY="$CLAUDE_SANDBOX_HTTP_PROXY"
-          export http_proxy="$CLAUDE_SANDBOX_HTTP_PROXY" https_proxy="$CLAUDE_SANDBOX_HTTP_PROXY"
-          export ALL_PROXY="$CLAUDE_SANDBOX_SOCKS_PROXY" all_proxy="$CLAUDE_SANDBOX_SOCKS_PROXY"
+        if [[ -n "$CCBOX_HTTP_PROXY" ]]; then
+          export HTTP_PROXY="$CCBOX_HTTP_PROXY" HTTPS_PROXY="$CCBOX_HTTP_PROXY"
+          export http_proxy="$CCBOX_HTTP_PROXY" https_proxy="$CCBOX_HTTP_PROXY"
+          export ALL_PROXY="$CCBOX_SOCKS_PROXY" all_proxy="$CCBOX_SOCKS_PROXY"
         else
           unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
         fi
         export NO_PROXY="localhost,127.0.0.1,::1"
         export no_proxy="$NO_PROXY"
+        alias l='ls -lah'
+        alias ll='ls -alh'
+        alias la='ls -A'
+
+        function cd {
+          if (( $# == 1 )); then
+            case "$1" in
+              ("/workspace"|"/workspace"/*) builtin cd "$_sandbox_workspace${1#/workspace}"; return $? ;;
+              ("/home"|"/home"/*) builtin cd "$_sandbox_home${1#/home}"; return $? ;;
+              ("/tmp"|"/tmp"/*) builtin cd "$_sandbox_tmp${1#/tmp}"; return $? ;;
+            esac
+          fi
+          builtin cd "$@"
+        }
 
         function _sandbox_display_path {
           local current="${PWD:A}"
@@ -1006,7 +974,7 @@ private struct ProxyLaunch: Sendable {
 
 private func makeSessionDirectory() throws -> URL {
     // Keep session directory path short so Unix domain sockets fit within Darwin's 103-byte limit.
-    var template = Array("/private/tmp/claude-sandbox.XXXXXX".utf8CString)
+    var template = Array("/private/tmp/ccbox-session.XXXXXX".utf8CString)
     guard let path = mkdtemp(&template) else { throw SandboxFailure("无法创建会话临时目录。") }
     return URL(fileURLWithPath: String(cString: path), isDirectory: true)
 }
@@ -1076,8 +1044,7 @@ private struct ToolPaths: Sendable {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var environment = [
             "PATH": paths.joined(separator: ":"), "HOME": home, "TERM": "xterm-256color",
-            "COLORTERM": "truecolor", "DISABLE_AUTOUPDATER": "1",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+            "COLORTERM": "truecolor", "DISABLE_AUTOUPDATER": "1"
         ]
         for key in ["LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME"] {
             environment[key] = ProcessInfo.processInfo.environment[key]
@@ -1091,10 +1058,11 @@ private struct ToolPaths: Sendable {
 
     static func discover(workspace: URL, needsProxy: Bool) throws -> ToolPaths {
         let mihomo = needsProxy ? try proxyOnly(workspace: workspace).0 : nil
-        let cliTools = ["claude", "agy", "codex"].flatMap { name -> [String] in
-            paths.map { URL(fileURLWithPath: $0).appendingPathComponent(name) }
-                .first { FileManager.default.isExecutableFile(atPath: $0.path) }
-                .map { [$0.path, $0.resolvingSymlinksInPath().path] } ?? []
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var cliTools = ["\(home)/.local/bin", "\(home)/.npm-global/bin"]
+        let developerTools = "/Applications/Xcode.app/Contents"
+        if FileManager.default.fileExists(atPath: developerTools) {
+            cliTools.append(developerTools)
         }
         let sandboxExec = "/usr/bin/sandbox-exec"
         guard FileManager.default.isExecutableFile(atPath: sandboxExec) else {
@@ -1208,13 +1176,13 @@ final class BrowserBridge: @unchecked Sendable {
     let token: String
     var variables: [String: String] {
         [
-            "CLAUDE_SANDBOX_BROWSER_PORT": String(port),
-            "CLAUDE_SANDBOX_BROWSER_TOKEN": token
+            "CCBOX_BROWSER_PORT": String(port),
+            "CCBOX_BROWSER_TOKEN": token
         ]
     }
 
     private let listenFD: Int32
-    private let queue = DispatchQueue(label: "ClaudeSandbox.browser.bridge", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "CCBox.browser.bridge", qos: .userInitiated)
     private let lock = NSLock()
     private var stopped = false
 

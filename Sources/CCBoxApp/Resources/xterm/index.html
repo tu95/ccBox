@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Claude Sandbox Terminal</title>
+  <title>CCBox Proxy Terminal</title>
   <link rel="stylesheet" href="./xterm.css" />
   <style>
     html, body {
@@ -141,14 +141,20 @@
         if (ev.metaKey && !ev.ctrlKey && !ev.altKey) {
           const key = ev.key.toLowerCase();
           if (key === 'c' && term.hasSelection()) {
+            ev.preventDefault();
+            ev.stopPropagation();
             post('terminalCopy', term.getSelection());
             return false;
           }
           if (key === 'v') {
+            ev.preventDefault();
+            ev.stopPropagation();
             post('terminalPaste', '');
             return false;
           }
           if (key === 'k') {
+            ev.preventDefault();
+            ev.stopPropagation();
             term.clear();
             return false;
           }

@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
-import ClaudeSandboxCore
+import CCBoxCore
 
 enum SandboxLaunchTarget {
     case session
@@ -63,7 +63,7 @@ final class DashboardModel: ObservableObject {
     init() {
         let demo = ProcessInfo.processInfo.arguments.contains("--demo")
         let demoRoot = demo ? URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("claude-sandbox-demo-\(UUID().uuidString)", isDirectory: true) : nil
+            .appendingPathComponent("ccbox-session-demo-\(UUID().uuidString)", isDirectory: true) : nil
         store = SandboxStore(root: demoRoot?.appendingPathComponent("state", isDirectory: true))
         demoPending = demo
         networkFilter.onChange = { [weak self] in self?.objectWillChange.send() }
@@ -243,11 +243,9 @@ final class DashboardModel: ObservableObject {
         catch { nodes = []; errorMessage = "读取可用节点失败：\(error.localizedDescription)" }
     }
 
-    func addEnvironment(name: String, workspace: URL, isolationMode: SandboxIsolationMode) {
+    func addEnvironment(name: String, workspace: URL) {
         let accent = SandboxEnvironment.nextAccentHex(avoiding: environments.map(\.resolvedAccentHex))
-        let environment = SandboxEnvironment(
-            name: name, workspace: workspace, isolationMode: isolationMode, accentHex: accent
-        )
+        let environment = SandboxEnvironment(name: name, workspace: workspace, accentHex: accent)
         do {
             var updated = environments
             updated.append(environment)
@@ -255,7 +253,7 @@ final class DashboardModel: ObservableObject {
             environments = updated
             _ = session(for: environment)
             select(environment)
-            notice = "环境已添加（\(isolationMode.displayName)）"
+            notice = "纯隔离环境已添加"
         } catch { errorMessage = "保存环境失败：\(error.localizedDescription)" }
     }
 
@@ -763,8 +761,8 @@ struct MainView: View {
             }
         }
         .sheet(isPresented: $showingAddEnvironment) {
-            AddEnvironmentSheet { name, workspace, isolationMode in
-                model.addEnvironment(name: name, workspace: workspace, isolationMode: isolationMode)
+            AddEnvironmentSheet { name, workspace in
+                model.addEnvironment(name: name, workspace: workspace)
             }
         }
         .sheet(isPresented: $showingSubscriptionImport) {
@@ -774,14 +772,12 @@ struct MainView: View {
             Button("好", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
         .confirmationDialog("移除此环境？", isPresented: $showingRemoveConfirmation, titleVisibility: .visible) {
-            Button(model.selected?.isolationMode == .hostPassthrough ? "删除环境配置" : "删除环境及沙箱副本", role: .destructive) {
+            Button("删除环境及沙箱副本", role: .destructive) {
                 model.removeSelected()
             }
             Button("取消", role: .cancel) { }
         } message: {
-            Text(model.selected?.isolationMode == .hostPassthrough
-                 ? "将删除环境配置、节点、独立的 Claude/Chrome 会话数据。你选的原项目目录完全保留。"
-                 : "将删除环境配置、节点和沙箱内的项目副本。你选的原项目会保留。")
+            Text("将删除环境配置、节点和沙箱内的项目副本。你选的原项目会保留。")
         }
         .confirmationDialog("当前未启用代理", isPresented: $showingNoProxyConfirmation, titleVisibility: .visible) {
             Button("仍要无代理启动（断网）", role: .destructive) {
@@ -834,17 +830,17 @@ struct MainView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(selected.name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                            Text(selected.isolationMode.displayName)
+                            Text(selected.displayName)
                                 .font(.system(size: 9, weight: .semibold))
                                 .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(selected.isolationMode == .hostPassthrough ? Color.orange.opacity(0.18) : Color.cyan.opacity(0.16))
-                                .foregroundStyle(selected.isolationMode == .hostPassthrough ? Color.orange : Color.cyan)
+                                .background(Color.cyan.opacity(0.16))
+                                .foregroundStyle(Color.cyan)
                                 .clipShape(Capsule())
                         }
                         Button {
                             NSWorkspace.shared.activateFileViewerSelecting([selected.workspace])
                         } label: {
-                            Text(selected.isolationMode == .hostPassthrough ? selected.workspace.path : "/workspace  ←  \(selected.workspace.lastPathComponent)")
+                            Text("/workspace  ←  \(selected.workspace.lastPathComponent)")
                                 .font(.system(size: 10.5, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -1272,11 +1268,11 @@ struct MainView: View {
                                         Text(environment.name)
                                             .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
                                             .lineLimit(1)
-                                        Text(environment.isolationMode == .hostPassthrough ? "直通" : "隔离")
+                                        Text("隔离")
                                             .font(.system(size: 8.5, weight: .semibold))
                                             .padding(.horizontal, 5).padding(.vertical, 1.5)
-                                            .background(environment.isolationMode == .hostPassthrough ? Color.orange.opacity(0.16) : Color.cyan.opacity(0.14))
-                                            .foregroundStyle(environment.isolationMode == .hostPassthrough ? Color.orange : Color.cyan)
+                                            .background(Color.cyan.opacity(0.14))
+                                            .foregroundStyle(Color.cyan)
                                             .clipShape(Capsule())
                                     }
                                     Text(environment.workspace.path)
@@ -1467,7 +1463,7 @@ struct MainView: View {
                         .help("在 Finder 中打开目录")
                     }
 
-                    Text(selected.isolationMode.summary)
+                    Text(selected.summary)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1677,35 +1673,25 @@ private struct SubscriptionImportSheet: View {
 }
 
 private struct AddEnvironmentSheet: View {
-    var onAdd: (String, URL, SandboxIsolationMode) -> Void
+    var onAdd: (String, URL) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var workspace: URL?
-    @State private var isolationMode: SandboxIsolationMode = .hostPassthrough
     @State private var chooseFolder = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("添加工作环境").font(.system(size: 18, weight: .semibold))
+            Text("添加纯隔离环境").font(.system(size: 18, weight: .semibold))
             VStack(alignment: .leading, spacing: 7) {
                 Text("环境名称").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 TextField("例如：my-project", text: $name).textFieldStyle(.roundedBorder)
             }
+            Text("首次启动时复制项目，使用独立 HOME、临时目录、应用数据和代理出口；原项目不会被修改。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 7) {
-                Text("运行模式").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                Picker("运行模式", selection: $isolationMode) {
-                    Text("本机直通").tag(SandboxIsolationMode.hostPassthrough)
-                    Text("纯隔离").tag(SandboxIsolationMode.isolated)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text(isolationMode.summary)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                Text("工作目录").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                Text("原项目目录").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 HStack {
                     Text(workspace?.path ?? "请选择项目文件夹").font(.system(size: 11, design: .monospaced)).foregroundStyle(workspace == nil ? .secondary : .primary).lineLimit(1)
                     Spacer()
@@ -1719,8 +1705,7 @@ private struct AddEnvironmentSheet: View {
                     guard let workspace else { return }
                     onAdd(
                         name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? workspace.lastPathComponent : name,
-                        workspace,
-                        isolationMode
+                        workspace
                     )
                     dismiss()
                 }.buttonStyle(.borderedProminent).disabled(workspace == nil)

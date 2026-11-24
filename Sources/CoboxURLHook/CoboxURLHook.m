@@ -167,8 +167,8 @@ static BOOL coboxShouldInterceptURL(NSURL *url) {
 static BOOL coboxForwardURL(NSURL *url) {
     if (!coboxShouldInterceptURL(url)) return NO;
 
-    const char *portEnv = getenv("CLAUDE_SANDBOX_BROWSER_PORT");
-    const char *tokenEnv = getenv("CLAUDE_SANDBOX_BROWSER_TOKEN");
+    const char *portEnv = getenv("CCBOX_BROWSER_PORT");
+    const char *tokenEnv = getenv("CCBOX_BROWSER_TOKEN");
     if (!portEnv || !tokenEnv || portEnv[0] == '\0' || tokenEnv[0] == '\0') {
         return NO;
     }
@@ -676,7 +676,7 @@ static void coboxInstallHooks(void) {
     coboxEnsureChildKeychainUnlocked();
 
     // 1. Browser URL redirection
-    if (coboxEnvPort("CLAUDE_SANDBOX_BROWSER_PORT") > 0) {
+    if (coboxEnvPort("CCBOX_BROWSER_PORT") > 0) {
         Class ws = [NSWorkspace class];
         coboxSwizzleInstance(ws, @selector(openURL:), @selector(cobox_openURL:));
         coboxSwizzleInstance(ws, @selector(openURL:configuration:completionHandler:),

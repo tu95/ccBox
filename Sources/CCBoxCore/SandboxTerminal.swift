@@ -61,7 +61,7 @@ public final class SandboxTerminal {
 private final class Connection: @unchecked Sendable {
     private let pid: pid_t
     private let descriptor: Int32
-    private let input = DispatchQueue(label: "ClaudeSandbox.terminal.input", qos: .userInteractive)
+    private let input = DispatchQueue(label: "CCBox.terminal.input", qos: .userInteractive)
     private let lock = NSLock()
     private var active = true
 

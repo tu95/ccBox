@@ -1,5 +1,5 @@
 import SwiftUI
-import ClaudeSandboxCore
+import CCBoxCore
 
 struct ProxyCheckPopoverView: View {
     let report: ProxyCheckReport
@@ -14,7 +14,7 @@ struct ProxyCheckPopoverView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(report.allPassed ? "全部检测通过 · 代理环境就绪" : (report.hasFailure ? "检测到风险项 · 请检查节点" : "大部分通过 · 存在提醒项"))
                         .font(.system(size: 13, weight: .semibold))
-                    Text("已通过 \(report.passedCount) / \(report.totalCount) 项 · 对齐 ip.net.coffee/claude")
+                    Text("已通过 \(report.passedCount) / \(report.totalCount) 项 · 纯代理环境覆盖检测")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }

@@ -1,5 +1,5 @@
 import AppKit
-import ClaudeSandboxCore
+import CCBoxCore
 import SwiftUI
 import WebKit
 
@@ -113,7 +113,7 @@ struct NativeTerminalView: NSViewRepresentable {
 
             private static func terminalIndexURL() -> URL? {
                 if let appBundle = Bundle.main.resourceURL?
-                    .appendingPathComponent("ClaudeSandbox_ClaudeSandboxApp.bundle", isDirectory: true),
+                    .appendingPathComponent("CCBox_CCBoxApp.bundle", isDirectory: true),
                    let bundle = Bundle(url: appBundle),
                    let url = bundle.url(forResource: "index", withExtension: "html", subdirectory: "xterm") {
                     return url

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct ClaudeSandboxApp: App {
+struct CCBoxApp: App {
     var body: some Scene {
         Window("ccbox", id: "ccbox-main") {
             MainView()

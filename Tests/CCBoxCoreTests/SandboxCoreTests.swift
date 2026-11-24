@@ -1,6 +1,6 @@
 import XCTest
 import CCBoxNetworkFilterCore
-@testable import ClaudeSandboxCore
+@testable import CCBoxCore
 
 final class SandboxCoreTests: XCTestCase {
     func testImportRemovesDirectAndPreservesPriorNodesAfterFailedImport() throws {
@@ -57,6 +57,23 @@ final class SandboxCoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.path))
     }
 
+    func testAdditionalTemporaryDirectoryVariables() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = SandboxStore(root: folder)
+        XCTAssertEqual(try store.additionalTemporaryDirectoryVariables(), [])
+
+        let configuration = folder.appendingPathComponent("temporary-directory-variables.json")
+        try #"["CUSTOM_RUNTIME_TMPDIR", "CUSTOM_RUNTIME_TMPDIR"]"#.write(to: configuration, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try store.additionalTemporaryDirectoryVariables(), ["CUSTOM_RUNTIME_TMPDIR"])
+
+        try #"["PATH"]"#.write(to: configuration, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try store.additionalTemporaryDirectoryVariables())
+        try "not json".write(to: configuration, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try store.additionalTemporaryDirectoryVariables())
+    }
+
     func testRuntimeVersionRequired() {
         XCTAssertFalse(supportsRuntimeVersion(Data("0.0.82\n".utf8)))
         XCTAssertTrue(supportsRuntimeVersion(Data("0.0.83\n".utf8)))
@@ -72,9 +89,9 @@ final class SandboxCoreTests: XCTestCase {
     }
 
     func testLiveSubscriptionImport() async throws {
-        guard let source = ProcessInfo.processInfo.environment["CLAUDE_SANDBOX_TEST_SUBSCRIPTION_URL"],
+        guard let source = ProcessInfo.processInfo.environment["CCBOX_TEST_SUBSCRIPTION_URL"],
               let url = URL(string: source) else {
-            throw XCTSkip("Set CLAUDE_SANDBOX_TEST_SUBSCRIPTION_URL to a test Clash subscription")
+            throw XCTSkip("Set CCBOX_TEST_SUBSCRIPTION_URL to a test Clash subscription")
         }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -87,8 +104,8 @@ final class SandboxCoreTests: XCTestCase {
 
     @MainActor
     func testLiveSeatbeltRequiresProxyAndAppliesTimeZone() async throws {
-        guard let proxyPort = ProcessInfo.processInfo.environment["CLAUDE_SANDBOX_TEST_PROXY_PORT"].flatMap(UInt16.init) else {
-            throw XCTSkip("Set CLAUDE_SANDBOX_TEST_PROXY_PORT to an HTTP proxy on 127.0.0.1")
+        guard let proxyPort = ProcessInfo.processInfo.environment["CCBOX_TEST_PROXY_PORT"].flatMap(UInt16.init) else {
+            throw XCTSkip("Set CCBOX_TEST_PROXY_PORT to an HTTP proxy on 127.0.0.1")
         }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -114,20 +131,19 @@ final class SandboxCoreTests: XCTestCase {
         })
 
         func throughSeatbelt(_ command: [String]) throws -> ToolResult {
-            try runTool(launch.executable, arguments: Array(launch.arguments.prefix(3)) + command,
-                        environment: environment, captureOutput: true)
+            try runTool(launch.executable, arguments: Array(launch.arguments.prefix(2)) + command,
+                        environment: environment, captureOutput: true, captureError: true)
         }
         let output = try throughSeatbelt(["/bin/sh", "-c", "printf '%s' \"$TZ\""])
-        XCTAssertEqual(output.status, 0)
+        XCTAssertEqual(output.status, 0, String(decoding: output.errorOutput, as: UTF8.self))
         XCTAssertEqual(String(decoding: output.output, as: UTF8.self), "UTC")
         let request = ["/usr/bin/curl", "-q", "--silent", "--max-time", "6", "--output", "/dev/null"]
-        let url = "https://api.anthropic.com/"
+        let url = "https://example.com/"
         XCTAssertEqual(try throughSeatbelt(request + [url]).status, 0)
         XCTAssertNotEqual(try throughSeatbelt(request + ["--noproxy", "*", url]).status, 0)
 
         let isolate = try throughSeatbelt(["/bin/cat", store.directory(for: configuration).appendingPathComponent("nodes.json").path])
         XCTAssertNotEqual(isolate.status, 0)
-        XCTAssertNotEqual(try throughSeatbelt(request + ["--fail", "https://example.com/"]).status, 0)
 
         let terminal = SandboxTerminal()
         let received = expectation(description: "Interactive zsh executed the command")
@@ -146,10 +162,10 @@ final class SandboxCoreTests: XCTestCase {
         await fulfillment(of: [received], timeout: 8)
         terminal.stop()
         XCTAssertTrue(ranCommand, "Startup output: \(String(decoding: terminalOutput.suffix(1_500), as: UTF8.self))")
-        let claude = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/claude")
-        if FileManager.default.isExecutableFile(atPath: claude.path) {
-            XCTAssertEqual(try throughSeatbelt(["/bin/zsh", "-fc", "claude --version"]).status, 0)
-        }
+
+        try await runner.startChrome()
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertNotNil(runner.browserProcessIdentifier, "Chrome must remain running under Seatbelt")
 
         let savedPolicy = folder.appendingPathComponent("closed-policy.json")
         try FileManager.default.copyItem(atPath: launch.arguments[1], toPath: savedPolicy.path)
@@ -186,6 +202,9 @@ final class SandboxCoreTests: XCTestCase {
         let environment = SandboxEnvironment(name: "Offline", workspace: workspace)
         let homeDirectory = store.directory(for: environment).appendingPathComponent("home", isDirectory: true)
         try makePrivateDirectory(homeDirectory)
+        try #"["CUSTOM_RUNTIME_TMPDIR"]"#.write(
+            to: store.root.appendingPathComponent("temporary-directory-variables.json"), atomically: true, encoding: .utf8
+        )
         try """
         precmd() { PROMPT='%n@%m %d '; RPROMPT='%d' }
         """.write(to: homeDirectory.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
@@ -205,7 +224,7 @@ final class SandboxCoreTests: XCTestCase {
             exited.fulfill()
         }
         try terminal.start(launch, columns: 100, rows: 30)
-        let command = #"pwd; (cd ~ && pwd); test "${psvar[127]}" = /workspace && test -z "$RPROMPT" && git config --global sandbox.probe works && test -f "$HOME/.gitconfig" && test "$(pwd)" = "$PWD" && test "$(pwd -P)" = "$(cd "$1" 2>/dev/null && pwd -P)" && test "$(cat project.txt)" = original && ! cat "$2/project.txt" 2>/dev/null && printf copied > project.txt && exit 0"#
+        let command = #"pwd; (cd ~ && pwd); (cd /tmp && test "$PWD" = "$TMPDIR") && (cd /workspace && test "$PWD" = "${1:A}") && test "${psvar[127]}" = /workspace && test -z "$RPROMPT" && test "$CUSTOM_RUNTIME_TMPDIR" = "$TMPDIR" && test "$XDG_RUNTIME_DIR" = "$TMPDIR" && test "$BUN_TMPDIR" = "$TMPDIR" && git config --global sandbox.probe works && test -f "$HOME/.gitconfig" && test "$(pwd)" = "$PWD" && test "$(pwd -P)" = "$(cd "$1" 2>/dev/null && pwd -P)" && test "$(cat project.txt)" = original && ! cat "$2/project.txt" 2>/dev/null && printf copied > project.txt && exit 0"#
         let workspacePath = launch.workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         let sourcePath = workspace.path.replacingOccurrences(of: "'", with: "'\\''")
         terminal.write(Data("set -- '\(workspacePath)' '\(sourcePath)'; \(command); exit 1\n".utf8))
@@ -243,7 +262,7 @@ final class SandboxCoreTests: XCTestCase {
     }
 
     func testNetworkFilterPolicyOnlyConstrainsManagedBundleCopies() throws {
-        let copiedChrome = "/Users/test/Library/Application Support/ClaudeSandbox/Runtime/Google Chrome.app"
+        let copiedChrome = "/Users/test/Library/Application Support/CCBox/Runtime/Google Chrome.app"
         let application = NetworkFilterApplication(bundlePath: copiedChrome, allowedLoopbackPorts: [18080, 18081])
         let policy = NetworkFilterPolicy(applications: [application])
         let executable = copiedChrome + "/Contents/MacOS/Google Chrome"
@@ -318,8 +337,8 @@ final class SandboxCoreTests: XCTestCase {
             "com.apple.security.device.camera": true,
             "com.apple.security.automation.apple-events": true,
             "aps-environment": "production",
-            "keychain-access-groups": ["EQHXZ8M8AV.com.google.GeminiMacOS"],
-            "com.apple.security.application-groups": ["group.com.google.gemini"],
+            "keychain-access-groups": ["EQHXZ8M8AV.com.google.ExampleMacOS"],
+            "com.apple.security.application-groups": ["group.com.google.example"],
             "com.apple.developer.team-identifier": "EQHXZ8M8AV"
         ]
         let originalData = try PropertyListSerialization.data(fromPropertyList: original, format: .xml, options: 0)

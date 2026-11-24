@@ -84,10 +84,6 @@ private func isValidIPAddress(_ value: String) -> Bool {
     return inet_pton(AF_INET, value, &ipv4) == 1 || inet_pton(AF_INET6, value, &ipv6) == 1
 }
 
-private let unsupportedClaudeRegions: Set<String> = [
-    "CN", "HK", "MO", "RU", "BY", "KP", "IR", "SY", "CU"
-]
-
 private func measureProxyURL(_ url: String, proxyEndpoint: String) -> Int? {
     let start = Date()
     let args = [
@@ -113,17 +109,16 @@ func runProxyPreFlightChecks(
 ) -> ProxyCheckReport {
     var items: [ProxyCheckItem] = []
 
-    // 1. Exit IP & Claude Supported Region
+    // 1. Exit IP & Network Location
     if let exitInfo {
         let place = [exitInfo.city, exitInfo.country].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ", ")
         let orgPart = [exitInfo.asn, exitInfo.isp].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
-        let supported = exitInfo.countryCode.map { !unsupportedClaudeRegions.contains($0) } ?? true
         let detail = [exitInfo.ip, place, orgPart].filter { !$0.isEmpty }.joined(separator: " · ")
         items.append(ProxyCheckItem(
             id: "exit-ip",
-            title: supported ? "出口 IP 与支持地区" : "出口地区不受 Claude 支持",
+            title: "出口 IP 与归属",
             detail: detail,
-            status: supported ? .pass : .fail
+            status: .pass
         ))
     } else {
         items.append(ProxyCheckItem(
@@ -151,30 +146,30 @@ func runProxyPreFlightChecks(
         ))
     }
 
-    // 3. Claude Connectivity & Latency
-    let claudeWebMs = measureProxyURL("https://claude.ai/", proxyEndpoint: proxyEndpoint)
-    let anthropicApiMs = measureProxyURL("https://api.anthropic.com/", proxyEndpoint: proxyEndpoint)
-    if let web = claudeWebMs, let api = anthropicApiMs {
+    // 3. Proxy Connectivity & Latency
+    let primaryMs = measureProxyURL("https://example.com/", proxyEndpoint: proxyEndpoint)
+    let secondaryMs = measureProxyURL("https://www.apple.com/", proxyEndpoint: proxyEndpoint)
+    if let primary = primaryMs, let secondary = secondaryMs {
         items.append(ProxyCheckItem(
-            id: "claude-reachability",
-            title: "Claude 连通性",
-            detail: "claude.ai \(web)ms · api.anthropic.com \(api)ms",
+            id: "proxy-reachability",
+            title: "代理连通性",
+            detail: "example.com \(primary)ms · apple.com \(secondary)ms",
             status: .pass
         ))
-    } else if claudeWebMs != nil || anthropicApiMs != nil {
-        let webStr = claudeWebMs.map { "\($0)ms" } ?? "不可达"
-        let apiStr = anthropicApiMs.map { "\($0)ms" } ?? "不可达"
+    } else if primaryMs != nil || secondaryMs != nil {
+        let primary = primaryMs.map { "\($0)ms" } ?? "不可达"
+        let secondary = secondaryMs.map { "\($0)ms" } ?? "不可达"
         items.append(ProxyCheckItem(
-            id: "claude-reachability",
-            title: "Claude 连通性",
-            detail: "claude.ai \(webStr) · api.anthropic.com \(apiStr)",
+            id: "proxy-reachability",
+            title: "代理连通性",
+            detail: "example.com \(primary) · apple.com \(secondary)",
             status: .warn
         ))
     } else {
         items.append(ProxyCheckItem(
-            id: "claude-reachability",
-            title: "Claude 连通性",
-            detail: "无法通过当前节点访问 claude.ai / api.anthropic.com",
+            id: "proxy-reachability",
+            title: "代理连通性",
+            detail: "无法通过当前节点访问通用网络检测地址",
             status: .fail
         ))
     }
@@ -187,7 +182,7 @@ func runProxyPreFlightChecks(
                 "-f", sandboxProfile.path,
                 "/usr/bin/curl", "--disable", "--silent", "--noproxy", "*",
                 "--connect-timeout", "2", "--max-time", "3",
-                "--output", "/dev/null", "https://api.anthropic.com/"
+                "--output", "/dev/null", "https://example.com/"
             ],
             environment: sandboxEnv
         )
@@ -195,7 +190,7 @@ func runProxyPreFlightChecks(
         items.append(ProxyCheckItem(
             id: "direct-block",
             title: "直连防泄露（Seatbelt）",
-            detail: blocked ? "内核已拦截非回环直连，强制走全局代理" : "检测到可绕过代理直连，请检查沙箱配置",
+            detail: blocked ? "内核已拦截非回环直连，强制走全局代理" : "检测到未经过代理的直连，请检查沙箱配置",
             status: blocked ? .pass : .fail
         ))
     } else {

@@ -57,8 +57,8 @@ staging="$(mktemp -d "$output/.build-app.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 app="$staging/$app_name"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$build/ClaudeSandboxApp" "$app/Contents/MacOS/"
-cp -R "$build/ClaudeSandbox_ClaudeSandboxCore.bundle" "$build/ClaudeSandbox_ClaudeSandboxApp.bundle" "$app/Contents/Resources/"
+cp "$build/CCBoxApp" "$app/Contents/MacOS/"
+cp -R "$build/CCBox_CCBoxCore.bundle" "$build/CCBox_CCBoxApp.bundle" "$app/Contents/Resources/"
 cp "$project/scripts/Info.plist" "$app/Contents/Info.plist"
 if [ -f "$project/scripts/AppIcon.icns" ]; then
   cp "$project/scripts/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"

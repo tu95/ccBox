@@ -1,5 +1,5 @@
 import Foundation
-import ClaudeSandboxCore
+import CCBoxCore
 
 do {
     let results = try await SandboxSelfTest.runAll()
