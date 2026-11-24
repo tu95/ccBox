@@ -58,6 +58,7 @@ trap 'rm -rf "$staging"' EXIT
 app="$staging/$app_name"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$build/CCBoxApp" "$app/Contents/MacOS/"
+cp "$build/CCBoxNestedLauncher" "$app/Contents/Resources/"
 cp -R "$build/CCBox_CCBoxCore.bundle" "$build/CCBox_CCBoxApp.bundle" "$app/Contents/Resources/"
 cp "$project/scripts/Info.plist" "$app/Contents/Info.plist"
 if [ -f "$project/scripts/AppIcon.icns" ]; then
@@ -82,6 +83,7 @@ if [ "$network_filter" = "1" ]; then
     --entitlements "$project/scripts/CCBoxNetworkFilter.entitlements" "$network_extension"
   codesign --verify --strict "$network_extension"
 fi
+codesign --force --sign "$sign_identity" "$app/Contents/Resources/CCBoxNestedLauncher"
 if [ -f "$project/Sources/CoboxURLHook/CoboxURLHook.m" ]; then
   arch_flag="$(uname -m)"
   /usr/bin/clang -dynamiclib -fobjc-arc -arch "$arch_flag" -mmacosx-version-min=13.0 \

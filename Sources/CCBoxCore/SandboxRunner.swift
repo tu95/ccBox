@@ -502,7 +502,22 @@ public final class SandboxRunner {
         }
 
         let launchExecutable = URL(fileURLWithPath: sandboxExec)
-        let launchArguments = ["-f", appSandboxProfile.path, prepared.executableURL.path] + appArguments
+        let launchArguments: [String]
+        if let hookDylib {
+            launchArguments = [
+                "-f", appSandboxProfile.path, "/bin/sh", "-c", Self.importedAppBootstrap,
+                "ccbox-imported-app", hookDylib.path, prepared.executableURL.path
+            ] + appArguments
+        } else {
+            launchArguments = ["-f", appSandboxProfile.path, prepared.executableURL.path] + appArguments
+        }
+
+        if let hookDylib {
+            try installNestedAppLaunchers(
+                in: prepared.bundleURL, sandboxExec: sandboxExec, profile: appSandboxProfile,
+                hookDylib: hookDylib, environment: environment
+            )
+        }
 
         if importedAppProcesses[app.id]?.isRunning == true {
             if initialURL != nil, prepared.isChromiumBased {
@@ -538,6 +553,36 @@ public final class SandboxRunner {
         try process.run()
         importedAppProcesses[app.id] = process
         onAppStart?(app.id, process.processIdentifier)
+    }
+
+    private func installNestedAppLaunchers(
+        in bundleURL: URL, sandboxExec: String, profile: URL, hookDylib: URL, environment: [String: String]
+    ) throws {
+        guard let launcher = coboxNestedLauncherURL() else { throw SandboxFailure("缺少嵌套应用启动器。") }
+        for executable in nestedAppExecutables(in: bundleURL) {
+            let original = executable.appendingPathExtension("ccbox-original")
+            if !FileManager.default.fileExists(atPath: original.path) {
+                try FileManager.default.moveItem(at: executable, to: original)
+            }
+            let exports = environment.keys.sorted().map {
+                "export \($0)=\(shellArgument(environment[$0] ?? ""))"
+            }.joined(separator: "\n")
+            let script = """
+            #!/bin/sh
+            \(exports)
+            wrapper="$1"
+            shift
+            exec \(shellArgument(sandboxExec)) -f \(shellArgument(profile.path)) /bin/sh -c \(shellArgument(Self.importedAppBootstrap)) ccbox-nested \(shellArgument(hookDylib.path)) "$wrapper.ccbox-original" "$@"
+            """
+            try writeExecutableScript(script, to: executable.appendingPathExtension("ccbox-launch"))
+
+            let staging = executable.appendingPathExtension("ccbox-new")
+            defer { try? FileManager.default.removeItem(at: staging) }
+            try FileManager.default.copyItem(at: launcher, to: staging)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
+            try FileManager.default.removeItem(at: executable)
+            try FileManager.default.moveItem(at: staging, to: executable)
+        }
     }
 
     public func stopImportedApp(_ appID: UUID) {
@@ -813,6 +858,12 @@ public final class SandboxRunner {
         export CCBOX_TMP="$2"
         cd "$CCBOX_WORKSPACE" || exit 1
         exec /bin/zsh -d -i
+        """
+
+    private static let importedAppBootstrap = """
+        export DYLD_INSERT_LIBRARIES="$1"
+        shift
+        exec "$@"
         """
 
     private static let browserShimScript = #"""
@@ -1164,6 +1215,10 @@ private func chromeEnvironment(
     environment["ALL_PROXY"] = "socks5h://127.0.0.1:\(proxyLaunch.socksPort)"
     environment["NO_PROXY"] = "localhost,127.0.0.1,::1"
     return environment
+}
+
+private func shellArgument(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
 private func writeExecutableScript(_ script: String, to url: URL) throws {

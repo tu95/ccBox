@@ -22,6 +22,7 @@ codesign --verify --strict "$dylib"
 
 symbols="$(nm -U "$dylib")"
 for sym in \
+  cobox_confstr \
   cobox_LSOpenCFURLRef \
   cobox_CFNetworkCopySystemProxySettings \
   cobox_SCDynamicStoreCopyProxies \
@@ -54,7 +55,7 @@ do
     exit 1
   fi
 done
-echo "[PASS] 14. libCoboxURLHook.dylib 编译、签名与全部 26 组核心拦截符号校验通过"
+echo "[PASS] 14. libCoboxURLHook.dylib 编译、签名与全部 27 组核心拦截符号校验通过"
 
 echo "=== [3/3] Running live DYLD_INSERT_LIBRARIES runtime behavior verification ==="
 probe_src="$tmp/hook_probe.m"
@@ -65,9 +66,14 @@ cat > "$probe_src" <<'EOF'
 #import <SystemConfiguration/SystemConfiguration.h>
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 int main(void) {
     @autoreleasepool {
+        assert(confstr(_CS_DARWIN_USER_DIR, NULL, 0) == strlen(getenv("TMPDIR")) + 1);
+        assert(confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0) == strlen(getenv("TMPDIR")) + 1);
+        assert(confstr(_CS_DARWIN_USER_CACHE_DIR, NULL, 0) == strlen(getenv("TMPDIR")) + 1);
+
         // 1. NSURLSessionConfiguration default / ephemeral / background + proxy clear lock
         NSURLSessionConfiguration *defCfg = [NSURLSessionConfiguration defaultSessionConfiguration];
         assert([defCfg.connectionProxyDictionary[(NSString *)kCFNetworkProxiesHTTPPort] intValue] == 28080);

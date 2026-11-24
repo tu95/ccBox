@@ -20,6 +20,28 @@ func resolveBundleExecutable(at bundleURL: URL) -> URL? {
     return FileManager.default.isExecutableFile(atPath: executable.path) ? executable : nil
 }
 
+func nestedAppExecutables(in bundleURL: URL) -> [URL] {
+    let root = bundleURL.standardizedFileURL
+    var executables: [URL] = []
+    func visit(_ directory: URL) {
+        let children = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )) ?? []
+        for child in children {
+            guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            if child.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+               child.standardizedFileURL != root,
+               let executable = resolveBundleExecutable(at: child) {
+                executables.append(executable)
+            }
+            visit(child)
+        }
+    }
+    visit(root)
+    return executables
+}
+
 func resolveBundleIdentifier(at bundleURL: URL) -> String? {
     let plistURL = bundleURL.appendingPathComponent("Contents/Info.plist")
     guard let data = try? Data(contentsOf: plistURL),
@@ -58,6 +80,14 @@ func isChromiumOrElectronApp(_ bundleURL: URL) -> Bool {
 func coboxURLHookDylibURL() -> URL? {
     guard let url = Bundle.main.resourceURL?.appendingPathComponent("libCoboxURLHook.dylib"),
           FileManager.default.fileExists(atPath: url.path) else {
+        return nil
+    }
+    return url
+}
+
+func coboxNestedLauncherURL() -> URL? {
+    guard let url = Bundle.main.resourceURL?.appendingPathComponent("CCBoxNestedLauncher"),
+          FileManager.default.isExecutableFile(atPath: url.path) else {
         return nil
     }
     return url
@@ -116,22 +146,51 @@ private func extractOriginalEntitlements(for executableURL: URL) -> Data? {
     return result.output
 }
 
-private func ensureHookableSignature(for executableURL: URL, targetDir: URL) {
-    let marker = targetDir.appendingPathComponent(".cobox-url-hook-v2")
+private func hasMachOMagic(_ url: URL) -> Bool {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+    defer { try? handle.close() }
+    guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
+    let magic = data.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    return [
+        0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe,
+        0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca
+    ].contains(magic)
+}
+
+private func ensureHookableSignature(for bundleURL: URL, targetDir: URL) {
+    let marker = targetDir.appendingPathComponent(".cobox-url-hook-v3")
     if FileManager.default.fileExists(atPath: marker.path) { return }
     let entitlementsURL = targetDir.appendingPathComponent(".cobox-hook-entitlements.plist")
     defer { try? FileManager.default.removeItem(at: entitlementsURL) }
-    let originalEntitlements = extractOriginalEntitlements(for: executableURL)
-    guard let mergedData = mergeHookEntitlements(originalPlistData: originalEntitlements),
-          (try? writePrivate(mergedData, to: entitlementsURL)) != nil else {
-        return
+
+    var binaries: [URL] = []
+    if let enumerator = FileManager.default.enumerator(
+        at: bundleURL, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+    ) {
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true,
+                  hasMachOMagic(url) else { continue }
+            binaries.append(url)
+        }
     }
-    let result = try? runTool(
-        "/usr/bin/codesign",
-        arguments: ["--force", "--sign", "-", "--entitlements", entitlementsURL.path, executableURL.path]
-    )
-    if result?.status == 0 {
-        try? writePrivate(Data("2\n".utf8), to: marker)
+
+    var succeeded = !binaries.isEmpty
+    for binary in binaries {
+        let originalEntitlements = extractOriginalEntitlements(for: binary)
+        guard let mergedData = mergeHookEntitlements(originalPlistData: originalEntitlements),
+              (try? writePrivate(mergedData, to: entitlementsURL)) != nil else {
+            succeeded = false
+            continue
+        }
+        let result = try? runTool(
+            "/usr/bin/codesign",
+            arguments: ["--force", "--sign", "-", "--entitlements", entitlementsURL.path, binary.path]
+        )
+        if result?.status != 0 { succeeded = false }
+    }
+    if succeeded {
+        try? writePrivate(Data("3\n".utf8), to: marker)
     }
 }
 
@@ -312,7 +371,7 @@ func prepareImportedAppBundle(
     }
     let isChrome = isChromeBundle(targetBundle)
     if !isChrome {
-        await Task.detached { ensureHookableSignature(for: executable, targetDir: targetDir) }.value
+        await Task.detached { ensureHookableSignature(for: targetBundle, targetDir: targetDir) }.value
     }
     return PreparedImportedApp(
         bundleURL: targetBundle,

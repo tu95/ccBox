@@ -312,6 +312,14 @@ final class SandboxCoreTests: XCTestCase {
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try plistData.write(to: source.appendingPathComponent("Contents/Info.plist"))
+        let helperMacOS = source.appendingPathComponent("Contents/Helpers/Helper.app/Contents/MacOS")
+        try FileManager.default.createDirectory(at: helperMacOS, withIntermediateDirectories: true)
+        let helper = helperMacOS.appendingPathComponent("Helper")
+        try "#!/bin/sh\nexit 0\n".write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        try PropertyListSerialization.data(fromPropertyList: ["CFBundleExecutable": "Helper"], format: .xml, options: 0)
+            .write(to: helperMacOS.deletingLastPathComponent().appendingPathComponent("Info.plist"))
+        XCTAssertEqual(nestedAppExecutables(in: source).map(\.lastPathComponent), ["Helper"])
 
         let store = SandboxStore(root: folder.appendingPathComponent("state"))
         let environment = SandboxEnvironment(name: "Independent", workspace: folder)
@@ -323,6 +331,7 @@ final class SandboxCoreTests: XCTestCase {
         try FileManager.default.removeItem(at: source)
         let prepared = try await prepareImportedAppBundle(imported, environmentID: environment.id, storeRoot: store.root)
         XCTAssertEqual(prepared.bundleURL.path, imported.bundlePath)
+        XCTAssertEqual(nestedAppExecutables(in: prepared.bundleURL).map(\.lastPathComponent), ["Helper"])
         XCTAssertEqual(
             try String(contentsOf: prepared.bundleURL.appendingPathComponent("Contents/Resources/Nested/asset.txt"), encoding: .utf8),
             "nested-resource"

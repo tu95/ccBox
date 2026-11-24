@@ -13,6 +13,18 @@
 
 // MARK: - Helpers
 
+static size_t cobox_confstr(int name, char *buf, size_t len) {
+    if (name == _CS_DARWIN_USER_DIR || name == _CS_DARWIN_USER_TEMP_DIR || name == _CS_DARWIN_USER_CACHE_DIR) {
+        const char *temporary = getenv("TMPDIR");
+        if (temporary && temporary[0] != '\0') {
+            size_t required = strlen(temporary) + 1;
+            if (buf && len > 0) strlcpy(buf, temporary, len);
+            return required;
+        }
+    }
+    return confstr(name, buf, len);
+}
+
 static int coboxEnvPort(const char *name) {
     const char *val = getenv(name);
     if (!val || val[0] == '\0') return 0;
@@ -807,6 +819,7 @@ static Boolean cobox_CFPreferencesSynchronize(CFStringRef applicationID, CFStrin
         (const void *)(unsigned long)&_replacee \
     };
 
+DYLD_INTERPOSE(cobox_confstr, confstr)
 DYLD_INTERPOSE(cobox_LSOpenCFURLRef, LSOpenCFURLRef)
 DYLD_INTERPOSE(cobox_CFNetworkCopySystemProxySettings, CFNetworkCopySystemProxySettings)
 DYLD_INTERPOSE(cobox_SCDynamicStoreCopyProxies, SCDynamicStoreCopyProxies)
