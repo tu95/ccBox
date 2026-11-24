@@ -74,6 +74,7 @@ public final class SandboxRunner {
     private var importedAppCopying: Set<UUID> = []
     private var browserBridge: BrowserBridge?
     private var browserOpenTask: Task<Void, Never>?
+    private var browserDebugPipe: ChromeDebugPipe?
     private var runtime: URL?
     private var sessionID: UUID?
     private var activeEnvironmentID: UUID?
@@ -222,8 +223,7 @@ public final class SandboxRunner {
         }
         if browser?.isRunning == true {
             if let initialURL {
-                try openURLInRunningChrome(initialURL, browserProfile: browserProfile, browserHome: browserHome,
-                                           toolEnvironment: toolEnvironment, proxyLaunch: proxyLaunch)
+                try await openURLInRunningChrome(initialURL)
                 return
             }
             throw SandboxFailure("Chrome 已在运行。")
@@ -233,8 +233,7 @@ public final class SandboxRunner {
         guard proxy?.isRunning == true else { throw SandboxFailure("代理已停止，请重新启动沙箱会话。") }
         if browser?.isRunning == true {
             if let initialURL {
-                try openURLInRunningChrome(initialURL, browserProfile: browserProfile, browserHome: browserHome,
-                                           toolEnvironment: toolEnvironment, proxyLaunch: proxyLaunch)
+                try await openURLInRunningChrome(initialURL)
             }
             return
         }
@@ -259,24 +258,35 @@ public final class SandboxRunner {
             browserTemporary: browserTemporary, browserProfile: browserProfile,
             browserHome: browserHome, proxyLaunch: proxyLaunch
         )
+        let debugPipe = ChromeDebugPipe()
+        debugPipe.start()
+        guard let launcher = coboxNestedLauncherURL() else { throw SandboxFailure("缺少 Chrome 控制通道启动器。") }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: sandboxExec)
-        process.arguments = ["-f", sandboxProfile.path, chromeBinary.path] + arguments
+        process.executableURL = launcher
+        process.arguments = [sandboxExec, "-f", sandboxProfile.path, chromeBinary.path] + arguments + ["--remote-debugging-pipe"]
         process.currentDirectoryURL = runtime
-        process.environment = environment
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
+        process.environment = environment.merging(debugPipe.environment) { _, value in value }
+        process.standardInput = debugPipe.input
+        process.standardOutput = debugPipe.output
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self, self.browser === finished else { return }
                 self.browser = nil
+                self.browserDebugPipe?.stop()
+                self.browserDebugPipe = nil
                 self.onBrowserExit?(finished.processIdentifier, finished.terminationStatus)
             }
         }
-        try process.run()
-        browser = process
-        onBrowserStart?(process.processIdentifier)
+        do {
+            try process.run()
+            browser = process
+            browserDebugPipe = debugPipe
+            onBrowserStart?(process.processIdentifier)
+        } catch {
+            debugPipe.stop()
+            throw error
+        }
     }
 
     private func makeChromeSandboxProfile(
@@ -339,33 +349,9 @@ public final class SandboxRunner {
         return chromeBinary
     }
 
-    private func openURLInRunningChrome(
-        _ url: URL, browserProfile: URL, browserHome: URL,
-        toolEnvironment: [String: String], proxyLaunch: ProxyLaunch
-    ) throws {
-        guard let runtime else { return }
-        let chromeBinary = store.root.appendingPathComponent("Runtime/Google Chrome.app/Contents/MacOS/Google Chrome")
-        guard FileManager.default.isExecutableFile(atPath: chromeBinary.path) else { return }
-        let browserTemporary = runtime.appendingPathComponent("chrome", isDirectory: true)
-        try makePrivateDirectory(browserTemporary)
-        guard let sandboxExec = activeSandboxExec else { throw SandboxFailure("隔离会话尚未准备完成。") }
-        let sandboxProfile = try makeChromeSandboxProfile(
-            browserTemporary: browserTemporary, browserProfile: browserProfile,
-            browserHome: browserHome, proxyLaunch: proxyLaunch
-        )
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: sandboxExec)
-        process.arguments = ["-f", sandboxProfile.path, chromeBinary.path]
-            + sandboxChromeArguments(browserProfile: browserProfile, proxyLaunch: proxyLaunch, initialURL: url)
-        process.currentDirectoryURL = runtime
-        process.environment = chromeEnvironment(
-            base: toolEnvironment, browserHome: browserHome, browserTemporary: browserTemporary,
-            proxyLaunch: proxyLaunch, timeZone: activeTimeZone
-        )
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
+    private func openURLInRunningChrome(_ url: URL) async throws {
+        guard let browserDebugPipe else { throw SandboxFailure("隔离 Chrome 控制通道不可用。") }
+        try await browserDebugPipe.open(url)
     }
 
     private func enqueueBrowserURL(_ url: URL, session token: UUID) {
@@ -638,6 +624,8 @@ public final class SandboxRunner {
         importedAppProcesses.removeAll()
         proxy = nil
         browserBridge = nil
+        browserDebugPipe?.stop()
+        browserDebugPipe = nil
         browserOpenTask?.cancel()
         browserOpenTask = nil
         runtime = nil

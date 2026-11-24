@@ -5,6 +5,14 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    const char *debugInput = getenv("CCBOX_CDP_READ_FD");
+    const char *debugOutput = getenv("CCBOX_CDP_WRITE_FD");
+    if (debugInput && debugOutput && argc > 1) {
+        if (dup2(0, 3) < 0 || dup2(1, 4) < 0) return 115;
+        execv(argv[1], &argv[1]);
+        return 116;
+    }
+
     uint32_t size = 0;
     if (_NSGetExecutablePath(NULL, &size) != -1) return 110;
     char *executable = malloc(size + 1);
