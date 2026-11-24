@@ -496,7 +496,7 @@ public final class SandboxRunner {
         if prepared.isChrome {
             appArguments = sandboxChromeArguments(browserProfile: appProfile, proxyLaunch: proxyLaunch, initialURL: initialURL)
         } else if prepared.isChromiumBased {
-            appArguments = ["--no-sandbox", "--use-mock-keychain"] + chromeArguments(browserProfile: appProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
+            appArguments = ["--use-mock-keychain"] + chromeArguments(browserProfile: appProfile, proxyPort: proxyLaunch.httpPort, initialURL: initialURL)
         } else {
             appArguments = ["-AppleLanguages", "(en-US, en)", "-AppleLocale", "en_US"]
         }
@@ -1154,6 +1154,7 @@ func supportsRuntimeVersion(_ data: Data) -> Bool {
 
 func chromeArguments(browserProfile: URL, proxyPort: UInt16, initialURL: URL? = nil) -> [String] {
     var arguments = [
+        "--no-sandbox",
         "--user-data-dir=\(browserProfile.path)",
         "--proxy-server=http://127.0.0.1:\(proxyPort)",
         "--proxy-bypass-list=127.0.0.1;localhost;[::1]",

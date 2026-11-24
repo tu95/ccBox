@@ -419,6 +419,7 @@ public enum SandboxSelfTest {
         defer { try? FileManager.default.removeItem(at: base) }
 
         let args = chromeArguments(browserProfile: profile, proxyPort: 28888, initialURL: nil)
+        try expect(args.contains("--no-sandbox"), "缺少与外层 Seatbelt 兼容的 Chromium 沙箱参数")
         try expect(args.contains { $0.hasPrefix("--user-data-dir=") }, "缺少独立用户目录")
         try expect(args.contains { $0.hasPrefix("--proxy-server=") && $0.hasSuffix(":28888") }, "缺少代理端口参数")
         try expect(args.contains { $0.hasPrefix("--host-resolver-rules=") }, "缺少禁本地 DNS 参数")
